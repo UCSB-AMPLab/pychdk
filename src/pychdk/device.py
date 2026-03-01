@@ -3,7 +3,10 @@
 Provides ChdkDevice — the main interface for controlling a CHDK
 camera — and list_devices() for discovery.
 """
+import atexit
+import signal
 import time
+import weakref
 from collections import namedtuple
 
 from pychdk.usb_transport import PTPDevice, find_ptp_devices, CANON_VENDOR_ID
@@ -60,6 +63,40 @@ def _find_usb_device(info):
     )
 
 
+# Track all open devices for cleanup on exit
+_open_devices = weakref.WeakSet()
+_original_sigint = None
+_original_sigterm = None
+
+
+def _cleanup_all():
+    """Close all open camera connections."""
+    for dev in list(_open_devices):
+        try:
+            dev.close()
+        except Exception:
+            pass
+
+
+def _signal_handler(signum, frame):
+    """Close cameras on SIGINT/SIGTERM, then re-raise."""
+    _cleanup_all()
+    # Restore original handler and re-raise
+    original = _original_sigint if signum == signal.SIGINT else _original_sigterm
+    if callable(original):
+        original(signum, frame)
+    elif original == signal.SIG_DFL:
+        signal.signal(signum, signal.SIG_DFL)
+        signal.raise_signal(signum)
+
+
+atexit.register(_cleanup_all)
+_original_sigint = signal.getsignal(signal.SIGINT)
+_original_sigterm = signal.getsignal(signal.SIGTERM)
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+
 class ChdkDevice:
     """High-level interface to a CHDK camera.
 
@@ -80,6 +117,7 @@ class ChdkDevice:
         self._transport.open()
         self._session.open()
         self._connected = True
+        _open_devices.add(self)
 
     @property
     def is_connected(self):
@@ -88,13 +126,14 @@ class ChdkDevice:
     def switch_mode(self, mode):
         """Switch camera to 'record' or 'play' mode.
 
-        Waits up to 5 seconds for the mode switch to take effect,
-        polling gently to avoid overwhelming the camera.
+        Waits for the switch_mode_usb script to finish, then polls
+        get_mode() to confirm the physical switch completed.
         """
         mode_val = 1 if mode == "record" else 0
         self.lua_execute(f"switch_mode_usb({mode_val})", do_return=False)
-        # Give the camera a moment before polling — it needs time to
-        # begin the physical mode switch (lens motor, etc.)
+        # Wait for the script to finish before polling
+        self._chdk.wait_for_script(timeout=5)
+        # Give the camera time to physically switch (lens motor, etc.)
         time.sleep(1)
         for _ in range(8):
             current = self.lua_execute("return get_mode()")
@@ -174,7 +213,8 @@ class ChdkDevice:
         """Capture to SD card, optionally download and delete."""
         script = "; ".join(setup_parts + ["shoot()"])
         self.lua_execute(script, do_return=False)
-        time.sleep(2)  # wait for camera to write to SD
+        # Wait for the shoot script to finish (shutter + SD write)
+        self._chdk.wait_for_script(timeout=30)
 
         if not download:
             return None
@@ -222,20 +262,13 @@ class ChdkDevice:
                 break
 
     def reconnect(self, wait=2.0):
-        """Reconnect to the camera."""
-        self._connected = False
-        try:
-            self._transport.close()
-        except Exception:
-            pass
-        time.sleep(wait)
-        self._transport.open()
-        self._session.open()
-        self._connected = True
+        """Reconnect to the camera with a USB reset.
 
-    def close(self):
-        """Close the connection to the camera."""
+        Closes the PTP session and USB interface, resets the USB
+        device to clear any stale state, then reopens everything.
+        """
         self._connected = False
+        _open_devices.discard(self)
         try:
             self._session.close()
         except Exception:
@@ -244,10 +277,28 @@ class ChdkDevice:
             self._transport.close()
         except Exception:
             pass
+        try:
+            self._usb_device.reset()
+        except Exception:
+            pass
+        time.sleep(wait)
+        self._transport.open()
+        self._session.open()
+        self._connected = True
+        _open_devices.add(self)
 
-    def __del__(self):
-        if self._connected:
-            self.close()
+    def close(self):
+        """Close the connection to the camera."""
+        self._connected = False
+        _open_devices.discard(self)
+        try:
+            self._session.close()
+        except Exception:
+            pass
+        try:
+            self._transport.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         return self

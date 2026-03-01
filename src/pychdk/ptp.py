@@ -4,6 +4,7 @@ Implements the container-based PTP protocol over USB bulk endpoints.
 Each transaction follows: Command -> [Data] -> Response.
 """
 import struct
+import time
 from enum import IntEnum
 
 
@@ -101,11 +102,17 @@ class PTPSession:
     command -> data -> response transaction cycle.
     """
 
+    # Minimum gap between PTP transactions in seconds.  The A2500 can
+    # get overwhelmed by rapid-fire commands; this floor only kicks in
+    # during tight loops like drain_messages.
+    MIN_TRANSACTION_GAP = 0.02  # 20 ms
+
     def __init__(self, transport):
         self._transport = transport
         self.session_id = 0
         self._transaction_id = 0
         self._is_open = False
+        self._last_transaction = 0.0
 
     def open(self):
         """Open a PTP session."""
@@ -141,6 +148,11 @@ class PTPSession:
             Tuple of (response_params, data_bytes). data_bytes is
             b"" if receive_data is False.
         """
+        # Enforce minimum gap between transactions
+        elapsed = time.monotonic() - self._last_transaction
+        if elapsed < self.MIN_TRANSACTION_GAP:
+            time.sleep(self.MIN_TRANSACTION_GAP - elapsed)
+
         tx_id = self._transaction_id
         self._transaction_id += 1
 
@@ -158,6 +170,7 @@ class PTPSession:
 
         # Response phase
         resp = self._receive_response()
+        self._last_transaction = time.monotonic()
         if resp.code != ResponseCode.OK:
             raise PTPError(resp.code)
 

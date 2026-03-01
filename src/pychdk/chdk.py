@@ -260,6 +260,16 @@ class ChdkPTP:
         )
         return data
 
+    def wait_for_script(self, timeout=30.0):
+        """Wait until no script is running on the camera."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            running, _ = self.get_script_status()
+            if not running:
+                return
+            time.sleep(0.5)
+        raise TimeoutError(f"Script still running after {timeout}s")
+
     def drain_messages(self):
         """Drain all pending messages from the script message queue."""
         for _ in range(50):
@@ -267,7 +277,6 @@ class ChdkPTP:
             if not has_msgs:
                 return
             self.read_script_message()
-            time.sleep(0.01)  # don't flood the camera
 
     def execute_lua_wait(self, script, timeout=10.0):
         """Execute a Lua script and wait for the return value.
