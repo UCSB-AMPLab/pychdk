@@ -118,6 +118,9 @@ class ChdkDevice:
         self._session.open()
         self._connected = True
         _open_devices.add(self)
+        # Re-register so our cleanup runs before any pyusb finalizers
+        # that were registered during device creation (atexit is LIFO).
+        atexit.register(_cleanup_all)
 
     @property
     def is_connected(self):

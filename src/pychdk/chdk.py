@@ -177,21 +177,19 @@ class ChdkPTP:
     def upload_file(self, data, remote_path):
         """Upload a file to the camera.
 
+        The data phase packs the remote filename and file contents
+        together: [4-byte filename length][filename][file data].
+
         Args:
             data: File contents as bytes.
             remote_path: Destination path on camera (e.g., 'A/OWN.TXT').
         """
-        # Upload protocol: send remote path via TEMP_DATA, then file via UPLOAD_FILE
-        path_bytes = remote_path.encode("utf-8") + b"\x00"
-        self._session.transaction(
-            OperationCode.CHDK,
-            params=[ChdkCommand.TEMP_DATA, 0],
-            send_data=path_bytes,
-        )
+        path_bytes = remote_path.encode("utf-8")
+        payload = struct.pack("<I", len(path_bytes)) + path_bytes + data
         self._session.transaction(
             OperationCode.CHDK,
             params=[ChdkCommand.UPLOAD_FILE],
-            send_data=data,
+            send_data=payload,
         )
 
     def download_file(self, remote_path):
@@ -203,7 +201,7 @@ class ChdkPTP:
         Returns:
             File contents as bytes.
         """
-        path_bytes = remote_path.encode("utf-8") + b"\x00"
+        path_bytes = remote_path.encode("utf-8")
         self._session.transaction(
             OperationCode.CHDK,
             params=[ChdkCommand.TEMP_DATA, 0],
