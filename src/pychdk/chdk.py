@@ -1,0 +1,1 @@
+"""CHDK PTP extension protocol."""
