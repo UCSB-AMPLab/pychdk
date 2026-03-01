@@ -260,11 +260,19 @@ class ChdkPTP:
         )
         return data
 
+    def drain_messages(self):
+        """Drain all pending messages from the script message queue."""
+        for _ in range(100):
+            _, has_msgs = self.get_script_status()
+            if not has_msgs:
+                return
+            self.read_script_message()
+
     def execute_lua_wait(self, script, timeout=10.0):
         """Execute a Lua script and wait for the return value.
 
-        Convenience method that handles script execution, polling
-        for completion, and reading the result message.
+        Drains stale messages first, then executes the script and
+        waits for its specific return message (matched by script_id).
 
         Args:
             script: Lua script string. Should use 'return' for a value.
@@ -273,12 +281,16 @@ class ChdkPTP:
         Returns:
             The script's return value (Python type).
         """
-        self.execute_script(script)
+        self.drain_messages()
+        script_id = self.execute_script(script)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             running, has_msgs = self.get_script_status()
             if has_msgs:
                 msg = self.read_script_message()
+                # Skip messages from older scripts
+                if msg.script_id != script_id:
+                    continue
                 if msg.msg_type == MessageType.RET:
                     return msg.value
                 if msg.msg_type == MessageType.ERR:

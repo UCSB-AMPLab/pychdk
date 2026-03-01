@@ -40,9 +40,16 @@ class MultiCam:
             return [f.result() for f in futures]
 
     def prepare_all(self, mode="record"):
-        """Switch all cameras to the specified mode."""
-        for cam in self.cameras:
-            cam.switch_mode(mode)
+        """Switch all cameras to the specified mode concurrently."""
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(self.cameras)
+        ) as pool:
+            futures = [
+                pool.submit(cam.switch_mode, mode)
+                for cam in self.cameras
+            ]
+            for f in futures:
+                f.result()
 
     def execute_all(self, lua_code, **kwargs):
         """Execute Lua code on all cameras concurrently.
