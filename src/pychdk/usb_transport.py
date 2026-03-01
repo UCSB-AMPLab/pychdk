@@ -3,7 +3,10 @@
 Handles device discovery, endpoint management, and raw bulk
 read/write operations over USB using pyusb.
 """
+import os
 import struct
+import subprocess
+import sys
 import usb.core
 import usb.util
 
@@ -54,6 +57,24 @@ def _has_ptp_interface(dev):
     except usb.core.USBError:
         return False
     return False
+
+
+def _kill_macos_ptp_daemon():
+    """Kill macOS PTP daemons that claim the USB interface.
+
+    macOS automatically launches ptpcamerad (or PTPCamera on older
+    versions) when a PTP device is connected, which grabs the USB
+    interface. We kill it and give it a moment to release.
+    """
+    import time
+    killed = False
+    for name in ("ptpcamerad", "PTPCamera"):
+        result = subprocess.run(["killall", name],
+                                capture_output=True, check=False)
+        if result.returncode == 0:
+            killed = True
+    if killed:
+        time.sleep(0.5)
 
 
 class PTPDevice:
@@ -122,6 +143,15 @@ class PTPDevice:
                 self._dev.detach_kernel_driver(self._intf_num)
         except (usb.core.USBError, NotImplementedError):
             pass
+
+        # On macOS, kill ptpcamerad which grabs PTP devices
+        if sys.platform == "darwin":
+            _kill_macos_ptp_daemon()
+            # Reset the device to clear stale state from the daemon
+            try:
+                self._dev.reset()
+            except usb.core.USBError:
+                pass
 
         usb.util.claim_interface(self._dev, self._intf_num)
 
