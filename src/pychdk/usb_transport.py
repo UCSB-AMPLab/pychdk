@@ -182,10 +182,6 @@ class PTPDevice:
             usb.util.release_interface(self._dev, self._intf_num)
         except usb.core.USBError:
             pass
-        try:
-            self._dev.reset()
-        except usb.core.USBError:
-            pass
         self._is_open = False
 
     def bulk_write(self, data, timeout=DEFAULT_TIMEOUT):
