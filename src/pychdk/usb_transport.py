@@ -175,13 +175,25 @@ class PTPDevice:
         self._is_open = True
 
     def close(self):
-        """Release the USB interface."""
+        """Release the USB interface and dispose of device resources.
+
+        Calls finalize() on the pyusb Device to prevent its weakref.finalize
+        atexit handler from trying to re-open the device after the libusb
+        context has been freed during Python shutdown (SIGSEGV).
+        """
         if not self._is_open:
             return
         try:
             usb.util.release_interface(self._dev, self._intf_num)
         except usb.core.USBError:
             pass
+        try:
+            usb.util.dispose_resources(self._dev)
+        except usb.core.USBError:
+            pass
+        # Mark the pyusb finalizer as done so atexit won't re-trigger it
+        if hasattr(self._dev, 'finalize'):
+            self._dev.finalize()
         self._is_open = False
 
     def bulk_write(self, data, timeout=DEFAULT_TIMEOUT):
