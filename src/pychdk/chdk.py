@@ -262,11 +262,12 @@ class ChdkPTP:
 
     def drain_messages(self):
         """Drain all pending messages from the script message queue."""
-        for _ in range(100):
+        for _ in range(50):
             _, has_msgs = self.get_script_status()
             if not has_msgs:
                 return
             self.read_script_message()
+            time.sleep(0.01)  # don't flood the camera
 
     def execute_lua_wait(self, script, timeout=10.0):
         """Execute a Lua script and wait for the return value.

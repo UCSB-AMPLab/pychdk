@@ -88,21 +88,21 @@ class ChdkDevice:
     def switch_mode(self, mode):
         """Switch camera to 'record' or 'play' mode.
 
-        Waits up to 3 seconds for the mode switch to take effect.
+        Waits up to 5 seconds for the mode switch to take effect,
+        polling gently to avoid overwhelming the camera.
         """
         mode_val = 1 if mode == "record" else 0
         self.lua_execute(f"switch_mode_usb({mode_val})", do_return=False)
-        # Wait for mode switch — the camera needs time to physically
-        # move the lens and reconfigure
-        for _ in range(15):
-            time.sleep(0.2)
+        # Give the camera a moment before polling — it needs time to
+        # begin the physical mode switch (lens motor, etc.)
+        time.sleep(1)
+        for _ in range(8):
             current = self.lua_execute("return get_mode()")
             # get_mode() returns 0 (falsy) for record, nonzero for play
             in_record = not current
             if (mode == "record" and in_record) or (mode == "play" and not in_record):
                 return
-        # If we timed out, give a final buffer
-        time.sleep(1)
+            time.sleep(0.5)
 
     def lua_execute(self, lua_code, do_return=True, timeout=10.0):
         """Execute Lua code on the camera.
@@ -244,6 +244,10 @@ class ChdkDevice:
             self._transport.close()
         except Exception:
             pass
+
+    def __del__(self):
+        if self._connected:
+            self.close()
 
     def __enter__(self):
         return self
