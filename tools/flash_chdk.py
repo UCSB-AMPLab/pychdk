@@ -7,11 +7,16 @@ writes OWN.TXT for camera side assignment (ODD/EVEN).
 """
 
 import plistlib
+import secrets
 import subprocess
 import sys
 import urllib.request
 import zipfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from pychdk.util import format_own_txt, parse_own_txt
 
 CHDK_URL = "https://www.mighty-hoernsche.de/bins/a2500-100a-1.6.1-6315-full.zip"
 CHDK_FILENAME = "a2500-100a-1.6.1-6315-full.zip"
@@ -184,8 +189,13 @@ def get_mount_point(disk: str) -> str:
 
 
 def write_camera_side(mount_point: str):
-    """Ask user for camera side and write OWN.TXT."""
-    choice = input("Which side is this camera? [o]dd / [e]ven / [s]kip: ").strip().lower()
+    """Ask which pages this camera shoots and write OWN.TXT.
+
+    The file carries the page parity and a stable id for the body. An
+    id already on the card is kept, so re-flashing a card does not
+    change which camera the toolkit thinks it is.
+    """
+    choice = input("Which pages does this camera shoot? [o]dd / [e]ven / [s]kip: ").strip().lower()
     if choice in ("o", "odd"):
         side = "ODD"
     elif choice in ("e", "even"):
@@ -198,8 +208,19 @@ def write_camera_side(mount_point: str):
         return
 
     own_txt = Path(mount_point) / "OWN.TXT"
-    own_txt.write_text(side + "\n")
-    print(f"Wrote OWN.TXT ({side})")
+    camera_id = None
+    try:
+        camera_id = parse_own_txt(own_txt.read_bytes())[1]
+    except OSError:
+        camera_id = None
+    if camera_id:
+        origin = "kept the id already on the card"
+    else:
+        camera_id = secrets.token_hex(6)
+        origin = "minted a new id"
+
+    own_txt.write_text(format_own_txt(side, camera_id))
+    print(f"Wrote OWN.TXT ({side}, id={camera_id}) — {origin}")
 
 
 def eject_card(disk: str):

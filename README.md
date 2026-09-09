@@ -87,9 +87,9 @@ pyusb / libusb    — raw USB access
 
 ## Camera side assignment
 
-For book scanning with two cameras, each camera is identified as "odd" or "even" (left/right pages). This is stored in a file called `OWN.TXT` on the camera's SD card containing either `ODD` or `EVEN`. The Captua workflow reads this via `download_file('OWN.TXT')` to determine page sequencing and EXIF orientation.
+For book scanning with two cameras, each body is assigned a page parity — which pages it shoots — stored in a file called `OWN.TXT` on the camera's SD card. The first line is `ODD` or `EVEN`; which of the two sits on the left is the operator's reading direction, and the file says nothing about it. A second line, `id=3f9a1c2b7d4e`, gives the body a stable identity, because pyusb cannot always read a serial number from a Canon compact. The Captua workflow reads the file via `download_file('A/OWN.TXT')` to determine page sequencing and EXIF orientation, and to tell one body from the other across replugs. Note the `A/` prefix: `download_file` and `upload_file` both take a card path.
 
-The `tools/flash_chdk.py` script writes this file during SD card preparation.
+The `tools/flash_chdk.py` script writes both lines during SD card preparation, keeping any id the card already carries. `parse_own_txt` and `format_own_txt` in `util.py` read and write the format.
 
 ## Tools
 
