@@ -273,9 +273,15 @@ class ChdkDevice:
         while time.monotonic() < deadline:
             ready, formats = self._chdk.remote_capture_is_ready()
             if ready:
+                # A mask without the format we asked for is a fault, not
+                # a menu: the other bits are a different picture.
+                if not formats & fmt:
+                    raise RuntimeError(
+                        f"The camera has no 0x{fmt:02x} data ready; "
+                        f"it offers 0x{formats:02x}"
+                    )
                 # The request parameter is one bit, not the whole mask.
-                data_type = fmt if formats & fmt else formats & -formats
-                return self._chdk.remote_capture_get_data(data_type)
+                return self._chdk.remote_capture_get_data(fmt)
             time.sleep(0.1)
         raise TimeoutError("Remote capture did not complete")
 

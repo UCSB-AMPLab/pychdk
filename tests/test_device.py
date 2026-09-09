@@ -114,13 +114,15 @@ class TestChdkDevice:
         assert dev.shoot(stream=True) == b"jpeg"
         mock_chdk.remote_capture_get_data.assert_called_once_with(1)
 
-    def test_streaming_falls_back_to_the_lowest_ready_bit(self):
+    def test_streaming_refuses_a_mask_without_the_requested_format(self):
         dev, mock_chdk = self._make_device()
-        # No JPEG on offer: RAW (0x2) and DNG header (0x4).
+        # No JPEG on offer: RAW (0x2) and DNG header (0x4). Returning
+        # raw framebuffer bytes as though they were the JPEG asked for
+        # would be a wrong picture, not a substitute.
         mock_chdk.remote_capture_is_ready.return_value = (True, 0x06)
-        mock_chdk.remote_capture_get_data.return_value = b"raw"
-        assert dev.shoot(stream=True) == b"raw"
-        mock_chdk.remote_capture_get_data.assert_called_once_with(2)
+        with pytest.raises(RuntimeError, match="0x01.*0x06"):
+            dev.shoot(stream=True)
+        mock_chdk.remote_capture_get_data.assert_not_called()
 
     def test_streaming_jpeg_is_unchanged(self):
         dev, mock_chdk = self._make_device()
