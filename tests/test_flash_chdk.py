@@ -97,7 +97,9 @@ class TestCameraIdSurvivesAReflash:
         tool.write_camera_side(str(tmp_path))
         assert not (tmp_path / "OWN.TXT").exists()
 
-    def test_reading_an_id_from_an_unusable_card_is_quiet(self, monkeypatch):
+    def test_a_card_that_will_not_mount_is_treated_as_blank(
+        self, monkeypatch, capsys,
+    ):
         tool = _load_tool()
 
         def refuse(disk):
@@ -105,3 +107,38 @@ class TestCameraIdSurvivesAReflash:
 
         monkeypatch.setattr(tool, "get_mount_point", refuse)
         assert tool.read_existing_camera_id("/dev/disk9") is None
+        assert "blank" in capsys.readouterr().out
+
+    def test_a_mounted_card_with_no_own_txt_has_no_id(
+        self, tmp_path, monkeypatch,
+    ):
+        tool = _load_tool()
+        monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
+        assert tool.read_existing_camera_id("/dev/disk9") is None
+
+    def test_an_unreadable_own_txt_stops_rather_than_reporting_no_id(
+        self, tmp_path, monkeypatch,
+    ):
+        tool = _load_tool()
+        # A path that exists but cannot be read as a file: not absence.
+        (tmp_path / "OWN.TXT").mkdir()
+        monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
+        with pytest.raises(SystemExit):
+            tool.read_existing_camera_id("/dev/disk9")
+
+    def test_main_does_not_erase_a_card_it_could_not_check(
+        self, tmp_path, monkeypatch,
+    ):
+        tool = _load_tool()
+        (tmp_path / "OWN.TXT").mkdir()
+        formatted = []
+        monkeypatch.setattr(tool, "download_chdk", lambda: None)
+        monkeypatch.setattr(tool, "find_removable_disks", lambda: [])
+        monkeypatch.setattr(tool, "pick_disk", lambda disks: "/dev/disk9")
+        monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
+        monkeypatch.setattr(
+            tool, "format_card", lambda disk: formatted.append(disk),
+        )
+        with pytest.raises(SystemExit):
+            tool.main()
+        assert formatted == []

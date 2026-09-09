@@ -188,27 +188,59 @@ def get_mount_point(disk: str) -> str:
     return info.get("MountPoint", f"/Volumes/{VOLUME_LABEL}")
 
 
+def _mounted_path(disk: str) -> str | None:
+    """Return where the card is mounted, or None if it will not mount.
+
+    get_mount_point exits the process when diskutil fails, which is
+    why SystemExit is caught here.
+    """
+    try:
+        return get_mount_point(disk)
+    except (SystemExit, ValueError):
+        return None
+
+
 def read_existing_camera_id(disk: str) -> str | None:
     """Read the camera id from a card before the card is erased.
 
     main() formats the card long before OWN.TXT could be read off it,
-    so the id has to be salvaged first or it is gone. A card that will
-    not mount, is unformatted, or carries no readable OWN.TXT simply
-    has no id: this never raises and never prompts. get_mount_point
-    exits the process when diskutil fails, which is why SystemExit is
-    caught here.
+    so the id has to be salvaged first or it is gone. That makes the
+    difference between "this card has no id" and "this card's id could
+    not be read" worth keeping: the first is an ordinary blank card,
+    the second means erasing would destroy an identity we cannot see.
+    A card that will not mount at all is the blank case — an
+    unformatted card is what this tool exists to format.
 
     Args:
         disk: /dev/diskN path.
 
     Returns:
-        The id already on the card, or None.
+        The id already on the card, or None if the card genuinely
+        carries none.
+
+    Raises:
+        SystemExit: If OWN.TXT is there but cannot be read, so that no
+            caller can go on to format the card.
     """
-    try:
-        mount_point = get_mount_point(disk)
-        data = (Path(mount_point) / "OWN.TXT").read_bytes()
-    except (SystemExit, OSError, ValueError):
+    mount_point = _mounted_path(disk)
+    if mount_point is None:
+        print("Card has no mountable volume; treating it as blank.")
         return None
+
+    own_txt = Path(mount_point) / "OWN.TXT"
+    try:
+        data = own_txt.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        print(f"Could not read {own_txt}: {exc}")
+        print(
+            "Stopping before the card is erased. This card may carry a "
+            "camera id, and formatting it would lose that body's "
+            "identity. Repair the card, or delete OWN.TXT deliberately, "
+            "then run this again."
+        )
+        sys.exit(1)
     return parse_own_txt(data)[1]
 
 
