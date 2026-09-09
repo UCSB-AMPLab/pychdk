@@ -142,6 +142,50 @@ class TestScriptErrors:
                 chdk.execute_lua_wait("bogus(")
 
 
+class TestScriptStartupStatus:
+    """ExecuteScript reports in param2 whether the script actually ran."""
+
+    def _make_chdk(self):
+        mock_session = MagicMock()
+        return ChdkPTP(mock_session), mock_session
+
+    def test_a_compile_error_refuses_the_script(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = ([0, ScriptErrorType.COMPILE], b"")
+        with pytest.raises(RuntimeError, match="compile"):
+            chdk.execute_script("bogus(")
+
+    def test_a_run_error_refuses_the_script(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = ([0, ScriptErrorType.RUN], b"")
+        with pytest.raises(RuntimeError, match="run"):
+            chdk.execute_script("error()")
+
+    def test_nokill_refusal_says_what_it_means(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = (
+            [0, ScriptErrorType.SCRIPT_RUNNING], b"",
+        )
+        with pytest.raises(RuntimeError, match="already running"):
+            chdk.execute_script("shoot()")
+
+    def test_a_zero_status_returns_the_script_id(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = ([7, ScriptErrorType.NONE], b"")
+        assert chdk.execute_script("return 1") == 7
+
+    def test_a_refused_script_fails_without_waiting(self):
+        chdk, session = self._make_chdk()
+        session.transaction.side_effect = [
+            ([0], b""),                             # drain: nothing pending
+            ([0, ScriptErrorType.COMPILE], b""),    # execute: refused
+        ]
+        with pytest.raises(RuntimeError, match="compile"):
+            chdk.execute_lua_wait("bogus(", timeout=30)
+        # The drain and the execute, and no polling loop after them.
+        assert session.transaction.call_count == 2
+
+
 class TestDecodeScriptValue:
     def test_integer(self):
         data = struct.pack("<i", 42)

@@ -179,8 +179,16 @@ class ChdkPTP:
             language: ScriptLanguage.LUA or ScriptLanguage.UBASIC.
             flags: ScriptFlag bitmask (NOKILL, FLUSH).
 
+        CHDK returns the script id in param1 and a startup status from
+        ptp_chdk_script_error_type in param2 (core/ptp.h). A nonzero
+        status means the script never started, so the id is not one:
+        waiting on it would only burn the caller's whole timeout.
+
         Returns:
             Script ID assigned by the camera.
+
+        Raises:
+            RuntimeError: If the camera refused to start the script.
         """
         script_bytes = script.encode("utf-8") + b"\x00"
         params, _ = self._session.transaction(
@@ -188,6 +196,14 @@ class ChdkPTP:
             params=[ChdkCommand.EXECUTE_SCRIPT, language | flags],
             send_data=script_bytes,
         )
+        status = params[1] if len(params) > 1 else 0
+        if status:
+            if status == ScriptErrorType.SCRIPT_RUNNING:
+                reason = ("a script is already running and NOKILL was set, "
+                          "so this one was refused")
+            else:
+                reason = f"{_script_error_name(status)} error"
+            raise RuntimeError(f"Script did not start: {reason}")
         return params[0] if params else 0
 
     def get_script_status(self):
