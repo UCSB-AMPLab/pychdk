@@ -7,6 +7,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import pychdk
 from pychdk import device
+from pychdk.chdk import (
+    MessageType,
+    ScriptDataType,
+    ScriptErrorType,
+    ScriptMessage,
+)
 from pychdk.device import ChdkDevice, list_devices, DeviceInfo
 
 
@@ -80,30 +86,100 @@ class TestChdkDevice:
         with pytest.raises(NotImplementedError, match="DNG"):
             dev.shoot(dng=True, stream=True)
 
+    def _ready_camera(self, mock_chdk, formats=0x01, data=b"jpeg"):
+        mock_chdk.execute_script.return_value = 7
+        mock_chdk.remote_capture_is_ready.return_value = (True, formats)
+        mock_chdk.remote_capture_get_data.return_value = data
+
     def test_streaming_initializes_and_shoots_in_one_script(self):
         dev, mock_chdk = self._make_device()
-        mock_chdk.execute_lua_wait.return_value = True
-        mock_chdk.remote_capture_is_ready.return_value = (True, 0x01)
-        mock_chdk.remote_capture_get_data.return_value = b"jpeg"
+        self._ready_camera(mock_chdk)
         assert dev.shoot(stream=True) == b"jpeg"
         # One script: a second one would kill the first, setup included.
-        assert mock_chdk.execute_lua_wait.call_count == 1
-        script = mock_chdk.execute_lua_wait.call_args[0][0]
+        assert mock_chdk.execute_script.call_count == 1
+        script = mock_chdk.execute_script.call_args[0][0]
         assert "init_usb_capture" in script
         assert "shoot()" in script
 
+    def test_streaming_downloads_without_waiting_for_the_script(self):
+        dev, mock_chdk = self._make_device()
+        self._ready_camera(mock_chdk)
+        assert dev.shoot(stream=True) == b"jpeg"
+        # Waiting for the script's return before downloading deadlocks:
+        # CHDK holds the pipeline until the host takes the data.
+        mock_chdk.execute_lua_wait.assert_not_called()
+        assert mock_chdk.remote_capture_is_ready.call_count >= 1
+
     def test_streaming_raises_when_the_camera_refuses_to_initialize(self):
         dev, mock_chdk = self._make_device()
-        mock_chdk.execute_lua_wait.return_value = False
+        mock_chdk.execute_script.return_value = 7
+        mock_chdk.remote_capture_is_ready.return_value = (False, 0)
+        mock_chdk.get_script_status.return_value = (True, True)
+        # init_usb_capture returned false, so the script returns false.
+        mock_chdk.read_script_message.return_value = ScriptMessage(
+            MessageType.RET, ScriptDataType.BOOLEAN, 7, False,
+        )
         with pytest.raises(RuntimeError, match="initialize remote capture"):
             dev.shoot(stream=True)
 
+    def test_streaming_raises_a_script_error_with_its_text(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 7
+        mock_chdk.remote_capture_is_ready.return_value = (False, 0)
+        mock_chdk.get_script_status.return_value = (True, True)
+        mock_chdk.read_script_message.return_value = ScriptMessage(
+            MessageType.ERR, ScriptErrorType.RUN, 7, "no such function",
+        )
+        with pytest.raises(RuntimeError, match="no such function"):
+            dev.shoot(stream=True)
+
+    def test_streaming_ignores_a_message_from_another_script(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 7
+        mock_chdk.remote_capture_is_ready.side_effect = [
+            (False, 0), (True, 0x01),
+        ]
+        mock_chdk.get_script_status.return_value = (True, True)
+        mock_chdk.read_script_message.return_value = ScriptMessage(
+            MessageType.ERR, ScriptErrorType.RUN, 3, "stale error",
+        )
+        mock_chdk.remote_capture_get_data.return_value = b"jpeg"
+        assert dev.shoot(stream=True) == b"jpeg"
+
     def test_streaming_tolerates_a_camera_that_returns_nothing(self):
         dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 7
+        mock_chdk.remote_capture_is_ready.side_effect = [
+            (False, 0), (True, 0x01),
+        ]
+        mock_chdk.get_script_status.return_value = (True, True)
         # An older CHDK returns nil, which is not a refusal.
-        mock_chdk.execute_lua_wait.return_value = None
-        mock_chdk.remote_capture_is_ready.return_value = (True, 0x01)
+        mock_chdk.read_script_message.return_value = ScriptMessage(
+            MessageType.RET, ScriptDataType.NIL, 7, None,
+        )
         mock_chdk.remote_capture_get_data.return_value = b"jpeg"
+        assert dev.shoot(stream=True) == b"jpeg"
+
+    def test_streaming_stops_when_the_script_ends_without_a_capture(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 7
+        mock_chdk.remote_capture_is_ready.return_value = (False, 0)
+        mock_chdk.get_script_status.return_value = (False, False)
+        with pytest.raises(RuntimeError, match="without producing a capture"):
+            dev.shoot(stream=True)
+        # Promptly, rather than spinning out the thirty-second deadline.
+        assert mock_chdk.remote_capture_is_ready.call_count == 1
+
+    def test_streaming_drains_the_script_after_downloading(self):
+        dev, mock_chdk = self._make_device()
+        self._ready_camera(mock_chdk)
+        assert dev.shoot(stream=True) == b"jpeg"
+        mock_chdk.drain_messages.assert_called_once()
+
+    def test_a_failure_draining_does_not_lose_the_picture(self):
+        dev, mock_chdk = self._make_device()
+        self._ready_camera(mock_chdk)
+        mock_chdk.drain_messages.side_effect = RuntimeError("late boom")
         assert dev.shoot(stream=True) == b"jpeg"
 
     def test_streaming_asks_for_a_single_data_type(self):

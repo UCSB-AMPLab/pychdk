@@ -233,9 +233,15 @@ class ChdkDevice:
         return error instead of killing", core/ptp.h) — so a separate
         shoot() could terminate the init_usb_capture that was still
         running and leave the camera taking an ordinary card shot while
-        we waited for bytes that were never coming. The script returns
-        after the shutter, so the readiness poll below usually finds
-        the data waiting on its first pass.
+        we waited for bytes that were never coming.
+
+        The script is started, not waited on, and that order matters:
+        CHDK can hold the capture pipeline until the host takes the
+        data, so waiting for the script to return before downloading
+        leaves both sides waiting on each other and the capture times
+        out having never once asked whether data was ready. We service
+        the camera while the script runs — readiness first, messages
+        second — and collect the script's result afterwards.
 
         Raises:
             RuntimeError: If the camera refuses to initialize remote
@@ -261,14 +267,9 @@ class ChdkDevice:
             "shoot(); "
             "return true"
         )
-        # Only an explicit false is a refusal: an older CHDK returns
-        # nothing at all, and nil must not be read as failure.
-        if self.lua_execute(script, timeout=30) is False:
-            raise RuntimeError(
-                "The camera refused to initialize remote capture: "
-                "init_usb_capture returned false"
-            )
+        script_id = self._chdk.execute_script(script)
 
+        image = None
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             ready, formats = self._chdk.remote_capture_is_ready()
@@ -281,9 +282,39 @@ class ChdkDevice:
                         f"it offers 0x{formats:02x}"
                     )
                 # The request parameter is one bit, not the whole mask.
-                return self._chdk.remote_capture_get_data(fmt)
+                image = self._chdk.remote_capture_get_data(fmt)
+                break
+
+            running, has_msgs = self._chdk.get_script_status()
+            if has_msgs:
+                msg = self._chdk.read_script_message()
+                if msg.script_id == script_id:
+                    if msg.msg_type == MessageType.ERR:
+                        raise RuntimeError(f"Capture script failed: {msg.value}")
+                    # Only an explicit false is a refusal: an older CHDK
+                    # returns nil, which must not be read as failure.
+                    if msg.msg_type == MessageType.RET and msg.value is False:
+                        raise RuntimeError(
+                            "The camera refused to initialize remote "
+                            "capture: init_usb_capture returned false"
+                        )
+                continue
+            if not running:
+                raise RuntimeError(
+                    "The capture script finished without producing a capture"
+                )
             time.sleep(0.1)
-        raise TimeoutError("Remote capture did not complete")
+
+        if image is None:
+            raise TimeoutError("Remote capture did not complete")
+
+        # Clear what the script left behind so the next capture does not
+        # read a stale message — but never at the cost of this picture.
+        try:
+            self._chdk.drain_messages()
+        except Exception:
+            pass
+        return image
 
     def _shoot_standard(self, setup_parts, download, remove):
         """Capture to SD card, optionally download and delete."""
