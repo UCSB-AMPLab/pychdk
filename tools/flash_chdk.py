@@ -200,6 +200,23 @@ def _mounted_path(disk: str) -> str | None:
         return None
 
 
+def _card_holds_a_volume(disk: str) -> bool:
+    """Ask diskutil whether the card has a first partition at all.
+
+    diskutil info exits nonzero for a partition that does not exist, so
+    a card with no filesystem answers False here. That is the only
+    card safe to erase without looking at it first.
+
+    Args:
+        disk: /dev/diskN path.
+
+    Returns:
+        True if the card reports a volume, False if it holds none.
+    """
+    result = _run(["diskutil", "info", "-plist", disk + "s1"], check=False)
+    return result.returncode == 0
+
+
 def read_existing_camera_id(disk: str) -> str | None:
     """Read the camera id from a card before the card is erased.
 
@@ -208,8 +225,10 @@ def read_existing_camera_id(disk: str) -> str | None:
     difference between "this card has no id" and "this card's id could
     not be read" worth keeping: the first is an ordinary blank card,
     the second means erasing would destroy an identity we cannot see.
-    A card that will not mount at all is the blank case — an
-    unformatted card is what this tool exists to format.
+    A card that reports no filesystem at all is genuinely blank, and
+    formatting one is what this tool is for. A card that reports a
+    volume we then could not mount or read is not blank — it is
+    unexamined, and erasing it would be a guess.
 
     Args:
         disk: /dev/diskN path.
@@ -219,13 +238,21 @@ def read_existing_camera_id(disk: str) -> str | None:
         carries none.
 
     Raises:
-        SystemExit: If OWN.TXT is there but cannot be read, so that no
-            caller can go on to format the card.
+        SystemExit: If the card holds a filesystem that could not be
+            inspected, so that no caller can go on to format it.
     """
     mount_point = _mounted_path(disk)
     if mount_point is None:
-        print("Card has no mountable volume; treating it as blank.")
-        return None
+        if not _card_holds_a_volume(disk):
+            print("Card holds no filesystem; treating it as blank.")
+            return None
+        print(
+            "The card holds a filesystem that could not be inspected. "
+            "Stopping before it is erased: it may carry a camera id, "
+            "and formatting would lose that body's identity. Check the "
+            "card and the reader, then run this again."
+        )
+        sys.exit(1)
 
     own_txt = Path(mount_point) / "OWN.TXT"
     try:
