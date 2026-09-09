@@ -217,8 +217,8 @@ def _card_holds_a_volume(disk: str) -> bool:
     return result.returncode == 0
 
 
-def read_existing_camera_id(disk: str) -> str | None:
-    """Read the camera id from a card before the card is erased.
+def read_existing_own_txt(disk: str) -> tuple[str | None, str | None]:
+    """Read a card's parity and camera id before the card is erased.
 
     main() formats the card long before OWN.TXT could be read off it,
     so the id has to be salvaged first or it is gone. That makes the
@@ -233,8 +233,12 @@ def read_existing_camera_id(disk: str) -> str | None:
     Args:
         disk: /dev/diskN path.
 
+    Both fields are salvaged, not just the id: an operator who skips
+    the parity prompt means "leave the assignment alone", which is only
+    possible if we still know what the assignment was.
+
     Returns:
-        The id already on the card, or None if the card genuinely
+        Tuple of (side, camera_id), each None if the card genuinely
         carries none.
 
     Raises:
@@ -245,7 +249,7 @@ def read_existing_camera_id(disk: str) -> str | None:
     if mount_point is None:
         if not _card_holds_a_volume(disk):
             print("Card holds no filesystem; treating it as blank.")
-            return None
+            return None, None
         print(
             "The card holds a filesystem that could not be inspected. "
             "Stopping before it is erased: it may carry a camera id, "
@@ -258,7 +262,7 @@ def read_existing_camera_id(disk: str) -> str | None:
     try:
         data = own_txt.read_bytes()
     except FileNotFoundError:
-        return None
+        return None, None
     except OSError as exc:
         print(f"Could not read {own_txt}: {exc}")
         print(
@@ -268,10 +272,11 @@ def read_existing_camera_id(disk: str) -> str | None:
             "then run this again."
         )
         sys.exit(1)
-    return parse_own_txt(data)[1]
+    return parse_own_txt(data)
 
 
-def write_camera_side(mount_point: str, existing_id: str | None = None):
+def write_camera_side(mount_point: str, existing_side: str | None = None,
+                      existing_id: str | None = None):
     """Ask which pages this camera shoots and write OWN.TXT.
 
     The file carries the page parity and a stable id for the body. An
@@ -283,9 +288,12 @@ def write_camera_side(mount_point: str, existing_id: str | None = None):
 
     Args:
         mount_point: Where the card is mounted.
+        existing_side: Parity read off the card before it was erased.
+            Skipping the prompt keeps it, so a card that said EVEN
+            still says EVEN.
         existing_id: Id read off the card before it was erased, if any.
-            Falls back to reading OWN.TXT here, for a card that was not
-            formatted in this run.
+            Both fall back to reading OWN.TXT here, for a card that was
+            not formatted in this run.
     """
     choice = input("Which pages does this camera shoot? [o]dd / [e]ven / [s]kip: ").strip().lower()
     if choice in ("o", "odd"):
@@ -294,18 +302,20 @@ def write_camera_side(mount_point: str, existing_id: str | None = None):
         side = "EVEN"
     elif choice in ("s", "skip", ""):
         print("Skipping camera side assignment.")
-        side = None
+        side = existing_side
     else:
         print(f"Unknown choice '{choice}', skipping.")
-        side = None
+        side = existing_side
 
     own_txt = Path(mount_point) / "OWN.TXT"
     camera_id = existing_id
-    if not camera_id:
+    if side is None or camera_id is None:
         try:
-            camera_id = parse_own_txt(own_txt.read_bytes())[1]
+            on_card_side, on_card_id = parse_own_txt(own_txt.read_bytes())
         except OSError:
-            camera_id = None
+            on_card_side, on_card_id = None, None
+        side = side or on_card_side
+        camera_id = camera_id or on_card_id
     if camera_id:
         origin = "kept the id already on the card"
     elif side:
@@ -330,13 +340,14 @@ def main():
     disks = find_removable_disks()
     disk = pick_disk(disks)
     # Salvage the body's identity before eraseDisk takes it away.
-    existing_id = read_existing_camera_id(disk)
+    existing_side, existing_id = read_existing_own_txt(disk)
     mount_point = format_card(disk)
     extract_chdk(zip_path, mount_point)
     patch_boot_sector(disk)
 
     mount_point = get_mount_point(disk)
-    write_camera_side(mount_point, existing_id=existing_id)
+    write_camera_side(mount_point, existing_side=existing_side,
+                      existing_id=existing_id)
     eject_card(disk)
     print("Done! Lock the SD card and insert into camera.")
 

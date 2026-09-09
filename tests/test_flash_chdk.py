@@ -29,16 +29,17 @@ class TestCameraIdSurvivesAReflash:
                 return result
             return fake
 
-        def fake_write(mount_point, existing_id=None):
+        def fake_write(mount_point, existing_side=None, existing_id=None):
             calls.append("write_camera_side")
+            received["existing_side"] = existing_side
             received["existing_id"] = existing_id
 
         monkeypatch.setattr(tool, "download_chdk", record("download_chdk"))
         monkeypatch.setattr(tool, "find_removable_disks", record("find", []))
         monkeypatch.setattr(tool, "pick_disk", record("pick_disk", "/dev/disk9"))
         monkeypatch.setattr(
-            tool, "read_existing_camera_id",
-            record("read_existing_camera_id", "abc123def456"),
+            tool, "read_existing_own_txt",
+            record("read_existing_own_txt", ("EVEN", "abc123def456")),
         )
         monkeypatch.setattr(tool, "format_card", record("format_card", "/Volumes/X"))
         monkeypatch.setattr(tool, "extract_chdk", record("extract_chdk"))
@@ -49,8 +50,9 @@ class TestCameraIdSurvivesAReflash:
 
         tool.main()
 
-        assert calls.index("read_existing_camera_id") < calls.index("format_card")
+        assert calls.index("read_existing_own_txt") < calls.index("format_card")
         assert received["existing_id"] == "abc123def456"
+        assert received["existing_side"] == "EVEN"
 
     def test_write_camera_side_keeps_the_id_it_is_handed(
         self, tmp_path, monkeypatch, capsys,
@@ -72,22 +74,44 @@ class TestCameraIdSurvivesAReflash:
         assert camera_id is not None
         assert "minted" in capsys.readouterr().out
 
-    def test_skipping_parity_still_writes_the_id_back(
+    def test_skipping_parity_leaves_the_existing_assignment_alone(
         self, tmp_path, monkeypatch, capsys,
+    ):
+        tool = _load_tool()
+        monkeypatch.setattr("builtins.input", lambda prompt="": "s")
+        tool.write_camera_side(
+            str(tmp_path), existing_side="EVEN", existing_id="abc123def456",
+        )
+        assert (tmp_path / "OWN.TXT").read_text() == "EVEN\nid=abc123def456\n"
+        assert "kept" in capsys.readouterr().out
+
+    def test_skipping_parity_on_a_card_that_had_none_writes_the_id_alone(
+        self, tmp_path, monkeypatch,
     ):
         tool = _load_tool()
         monkeypatch.setattr("builtins.input", lambda prompt="": "s")
         tool.write_camera_side(str(tmp_path), existing_id="abc123def456")
         assert (tmp_path / "OWN.TXT").read_text() == "id=abc123def456\n"
-        assert "kept" in capsys.readouterr().out
 
-    def test_an_unrecognized_answer_still_writes_the_id_back(
+    def test_an_unrecognized_answer_leaves_the_assignment_alone(
         self, tmp_path, monkeypatch,
     ):
         tool = _load_tool()
         monkeypatch.setattr("builtins.input", lambda prompt="": "banana")
-        tool.write_camera_side(str(tmp_path), existing_id="abc123def456")
-        assert (tmp_path / "OWN.TXT").read_text() == "id=abc123def456\n"
+        tool.write_camera_side(
+            str(tmp_path), existing_side="ODD", existing_id="abc123def456",
+        )
+        assert (tmp_path / "OWN.TXT").read_text() == "ODD\nid=abc123def456\n"
+
+    def test_choosing_a_parity_overrides_the_one_on_the_card(
+        self, tmp_path, monkeypatch,
+    ):
+        tool = _load_tool()
+        monkeypatch.setattr("builtins.input", lambda prompt="": "o")
+        tool.write_camera_side(
+            str(tmp_path), existing_side="EVEN", existing_id="abc123def456",
+        )
+        assert (tmp_path / "OWN.TXT").read_text() == "ODD\nid=abc123def456\n"
 
     def test_skipping_parity_with_no_id_writes_nothing(
         self, tmp_path, monkeypatch,
@@ -107,7 +131,7 @@ class TestCameraIdSurvivesAReflash:
 
         monkeypatch.setattr(tool, "get_mount_point", refuse)
         monkeypatch.setattr(tool, "_card_holds_a_volume", lambda disk: False)
-        assert tool.read_existing_camera_id("/dev/disk9") is None
+        assert tool.read_existing_own_txt("/dev/disk9") == (None, None)
         assert "blank" in capsys.readouterr().out
 
     def test_a_volume_that_will_not_mount_stops_the_run(
@@ -122,7 +146,7 @@ class TestCameraIdSurvivesAReflash:
         # diskutil says there is a filesystem, but it would not mount.
         monkeypatch.setattr(tool, "_card_holds_a_volume", lambda disk: True)
         with pytest.raises(SystemExit):
-            tool.read_existing_camera_id("/dev/disk9")
+            tool.read_existing_own_txt("/dev/disk9")
         assert "could not be inspected" in capsys.readouterr().out
 
     def test_main_does_not_erase_a_volume_it_could_not_mount(
@@ -152,7 +176,7 @@ class TestCameraIdSurvivesAReflash:
         tool = _load_tool()
         monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
         monkeypatch.setattr(tool, "_card_holds_a_volume", lambda disk: True)
-        assert tool.read_existing_camera_id("/dev/disk9") is None
+        assert tool.read_existing_own_txt("/dev/disk9") == (None, None)
 
     def test_an_unreadable_own_txt_stops_rather_than_reporting_no_id(
         self, tmp_path, monkeypatch,
@@ -162,7 +186,7 @@ class TestCameraIdSurvivesAReflash:
         (tmp_path / "OWN.TXT").mkdir()
         monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
         with pytest.raises(SystemExit):
-            tool.read_existing_camera_id("/dev/disk9")
+            tool.read_existing_own_txt("/dev/disk9")
 
     def test_main_does_not_erase_a_card_it_could_not_check(
         self, tmp_path, monkeypatch,
