@@ -51,6 +51,18 @@ class MessageType(IntEnum):
     USER = 3
 
 
+class ScriptErrorType(IntEnum):
+    """ptp_chdk_script_error_type, the subtype of an ERR message.
+
+    SCRIPT_RUNNING is an ExecuteScript startup status only, never a
+    message subtype, per core/ptp.h.
+    """
+    NONE = 0
+    COMPILE = 1
+    RUN = 2
+    SCRIPT_RUNNING = 0x1000
+
+
 class ScriptFlag(IntEnum):
     NONE = 0
     NOKILL = 0x100
@@ -72,6 +84,30 @@ MAX_CAPTURE_CHUNKS = 10000
 
 
 ScriptMessage = namedtuple("ScriptMessage", ["msg_type", "data_type", "script_id", "value"])
+ScriptMessage.__doc__ = """One message from the camera's script queue.
+
+The data_type field carries whichever subtype the message type calls
+for, as core/ptp.h defines it: a ScriptDataType for RET and USER
+messages, and a ScriptErrorType for ERR. The field keeps its name for
+the sake of callers that already read it.
+"""
+
+
+def _script_error_name(error_type):
+    """Name a script error type for a message a human has to read.
+
+    Args:
+        error_type: Value of an ERR message's subtype, or an
+            ExecuteScript startup status.
+
+    Returns:
+        Lowercase name, or the raw value in hex if CHDK sends one we
+        do not know.
+    """
+    try:
+        return ScriptErrorType(error_type).name.lower()
+    except ValueError:
+        return f"unknown 0x{int(error_type):x}"
 
 
 def _as_signed32(value):
@@ -175,8 +211,16 @@ class ChdkPTP:
           [msg_type, data_type, script_id, data_size]
         Data phase contains the raw value bytes.
 
+        Param2 is the message subtype, and what it means depends on the
+        message type: for RET and USER it is a ScriptDataType, but for
+        ERR it is a ScriptErrorType, and the data phase is the error
+        text rather than an encoded value. Reading an ERR's subtype as
+        a data type silently threw that text away — the two enums
+        overlap, so COMPILE decoded as NIL and RUN as BOOLEAN.
+
         Returns:
-            ScriptMessage namedtuple.
+            ScriptMessage namedtuple. Its data_type field holds an
+            error type when msg_type is ERR, a data type otherwise.
         """
         params, data = self._session.transaction(
             OperationCode.CHDK,
@@ -188,7 +232,11 @@ class ChdkPTP:
         msg_type = params[0]
         data_type = params[1] if len(params) > 1 else ScriptDataType.NIL
         script_id = params[2] if len(params) > 2 else 0
-        value = _decode_script_value(data_type, data)
+        if msg_type == MessageType.ERR:
+            # The header guarantees at least one zero byte, even empty.
+            value = data.decode("utf-8", errors="replace").rstrip("\x00")
+        else:
+            value = _decode_script_value(data_type, data)
         return ScriptMessage(msg_type, data_type, script_id, value)
 
     def write_script_message(self, message, script_id=0):
@@ -407,7 +455,8 @@ class ChdkPTP:
                 if msg.msg_type == MessageType.RET:
                     return msg.value
                 if msg.msg_type == MessageType.ERR:
-                    raise RuntimeError(f"Script error: {msg.value}")
+                    kind = _script_error_name(msg.data_type)
+                    raise RuntimeError(f"Script error ({kind}): {msg.value}")
             if not running and not has_msgs:
                 return None
             time.sleep(0.05)

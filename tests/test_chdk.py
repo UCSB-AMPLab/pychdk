@@ -1,13 +1,15 @@
 """Tests for CHDK PTP extension protocol."""
 import struct
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import pytest
 from pychdk.chdk import (
     ChdkPTP,
     ChdkCommand,
     ScriptLanguage,
     ScriptDataType,
+    ScriptErrorType,
     MessageType,
+    ScriptMessage,
     _decode_script_value,
 )
 from pychdk.ptp import ResponseCode, PTPContainer, ContainerType
@@ -73,6 +75,71 @@ class TestChdkPTP:
         msg = chdk.read_script_message()
         assert msg.msg_type == MessageType.NONE
         assert msg.value is None
+
+
+class TestScriptErrors:
+    """An ERR message's subtype is an error type, not a data type."""
+
+    def _make_chdk(self):
+        mock_session = MagicMock()
+        return ChdkPTP(mock_session), mock_session
+
+    def test_a_compile_error_keeps_its_text_and_kind(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = (
+            [MessageType.ERR, ScriptErrorType.COMPILE, 7, 28],
+            b"attempt to call a nil value\x00",
+        )
+        msg = chdk.read_script_message()
+        assert msg.data_type == ScriptErrorType.COMPILE
+        assert msg.value == "attempt to call a nil value"
+
+    def test_a_run_error_keeps_its_text_and_kind(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = (
+            [MessageType.ERR, ScriptErrorType.RUN, 7, 15],
+            b"bad argument\x00",
+        )
+        msg = chdk.read_script_message()
+        assert msg.data_type == ScriptErrorType.RUN
+        assert msg.value == "bad argument"
+
+    def test_an_error_with_no_text_is_empty_but_still_named(self):
+        chdk, session = self._make_chdk()
+        # The header promises at least one zero byte even with no message.
+        session.transaction.return_value = (
+            [MessageType.ERR, ScriptErrorType.RUN, 7, 1],
+            b"\x00",
+        )
+        msg = chdk.read_script_message()
+        assert msg.data_type == ScriptErrorType.RUN
+        assert msg.value == ""
+
+    def test_a_return_value_with_a_colliding_subtype_still_decodes(self):
+        chdk, session = self._make_chdk()
+        # Subtype 2 is BOOLEAN for a RET and ERRTYPE_RUN for an ERR.
+        session.transaction.return_value = (
+            [MessageType.RET, ScriptDataType.BOOLEAN, 7, 4],
+            struct.pack("<I", 1),
+        )
+        msg = chdk.read_script_message()
+        assert msg.value is True
+
+    def test_execute_lua_wait_reports_the_kind_and_the_text(self):
+        chdk, session = self._make_chdk()
+        failure = ScriptMessage(
+            MessageType.ERR, ScriptErrorType.COMPILE, 7,
+            "attempt to call a nil value",
+        )
+        with patch.object(chdk, "drain_messages"), \
+             patch.object(chdk, "execute_script", return_value=7), \
+             patch.object(chdk, "get_script_status", return_value=(True, True)), \
+             patch.object(chdk, "read_script_message", return_value=failure):
+            with pytest.raises(
+                RuntimeError,
+                match=r"Script error \(compile\): attempt to call a nil value",
+            ):
+                chdk.execute_lua_wait("bogus(")
 
 
 class TestDecodeScriptValue:
