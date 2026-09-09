@@ -1,6 +1,12 @@
 """Tests for high-level ChdkDevice API."""
+import importlib
+import signal
+import sys
+import threading
 from unittest.mock import MagicMock, patch
 import pytest
+import pychdk
+from pychdk import device
 from pychdk.device import ChdkDevice, list_devices, DeviceInfo
 
 
@@ -73,3 +79,72 @@ class TestChdkDevice:
         dev, mock_chdk = self._make_device()
         dev.close()
         assert not dev.is_connected
+
+
+class TestSignalHandlers:
+    """Signal handlers may only be installed from the main thread."""
+
+    def test_importing_from_a_worker_thread_does_not_raise(self):
+        saved_module = sys.modules.pop("pychdk.device", None)
+        failures = []
+
+        def reimport():
+            try:
+                importlib.import_module("pychdk.device")
+            except BaseException as exc:
+                failures.append(exc)
+
+        try:
+            thread = threading.Thread(target=reimport)
+            thread.start()
+            thread.join()
+        finally:
+            if saved_module is not None:
+                sys.modules["pychdk.device"] = saved_module
+                pychdk.device = saved_module
+        assert failures == []
+
+    def test_declines_on_a_worker_thread(self):
+        before = (
+            signal.getsignal(signal.SIGINT),
+            signal.getsignal(signal.SIGTERM),
+        )
+        results = []
+
+        def install():
+            results.append(device.install_signal_handlers())
+
+        thread = threading.Thread(target=install)
+        thread.start()
+        thread.join()
+        assert results == [False]
+        assert signal.getsignal(signal.SIGINT) is before[0]
+        assert signal.getsignal(signal.SIGTERM) is before[1]
+
+    def test_installing_twice_keeps_the_first_saved_originals(self):
+        saved_handlers = (
+            signal.getsignal(signal.SIGINT),
+            signal.getsignal(signal.SIGTERM),
+        )
+        saved_originals = (device._original_sigint, device._original_sigterm)
+
+        def sentinel_sigint(signum, frame):
+            pass
+
+        def sentinel_sigterm(signum, frame):
+            pass
+
+        try:
+            signal.signal(signal.SIGINT, sentinel_sigint)
+            signal.signal(signal.SIGTERM, sentinel_sigterm)
+            assert device.install_signal_handlers() is True
+            assert device.install_signal_handlers() is True
+            assert signal.getsignal(signal.SIGINT) is device._signal_handler
+            assert signal.getsignal(signal.SIGTERM) is device._signal_handler
+            assert device._original_sigint is sentinel_sigint
+            assert device._original_sigterm is sentinel_sigterm
+        finally:
+            signal.signal(signal.SIGINT, saved_handlers[0])
+            signal.signal(signal.SIGTERM, saved_handlers[1])
+            device._original_sigint = saved_originals[0]
+            device._original_sigterm = saved_originals[1]

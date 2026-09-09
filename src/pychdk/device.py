@@ -5,6 +5,7 @@ camera — and list_devices() for discovery.
 """
 import atexit
 import signal
+import threading
 import time
 import weakref
 from collections import namedtuple
@@ -90,11 +91,44 @@ def _signal_handler(signum, frame):
         signal.raise_signal(signum)
 
 
+def install_signal_handlers():
+    """Install the SIGINT/SIGTERM handlers that close open cameras.
+
+    Python only allows handlers to be installed from the main thread of
+    the main interpreter, so this declines anywhere else instead of
+    raising: a host that first imports pychdk inside a worker thread —
+    a synchronous FastAPI route, say — would otherwise fail on the
+    import. Such a host can call this later from its main thread to get
+    the handlers after all. Installing twice is harmless; the originals
+    are captured once.
+
+    Returns:
+        True if our handlers are in place, False if it declined.
+    """
+    global _original_sigint, _original_sigterm
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    current_sigint = signal.getsignal(signal.SIGINT)
+    current_sigterm = signal.getsignal(signal.SIGTERM)
+    if current_sigint is _signal_handler and current_sigterm is _signal_handler:
+        return True
+    # Never save our own handler as the original: that would recurse.
+    if current_sigint is not _signal_handler:
+        _original_sigint = current_sigint
+    if current_sigterm is not _signal_handler:
+        _original_sigterm = current_sigterm
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+    except ValueError:
+        # Some embeddings refuse even on the main thread.
+        return False
+    return True
+
+
+# atexit is thread-safe, so it is registered unconditionally.
 atexit.register(_cleanup_all)
-_original_sigint = signal.getsignal(signal.SIGINT)
-_original_sigterm = signal.getsignal(signal.SIGTERM)
-signal.signal(signal.SIGINT, _signal_handler)
-signal.signal(signal.SIGTERM, _signal_handler)
+install_signal_handlers()
 
 
 class ChdkDevice:
