@@ -188,12 +188,42 @@ def get_mount_point(disk: str) -> str:
     return info.get("MountPoint", f"/Volumes/{VOLUME_LABEL}")
 
 
-def write_camera_side(mount_point: str):
+def read_existing_camera_id(disk: str) -> str | None:
+    """Read the camera id from a card before the card is erased.
+
+    main() formats the card long before OWN.TXT could be read off it,
+    so the id has to be salvaged first or it is gone. A card that will
+    not mount, is unformatted, or carries no readable OWN.TXT simply
+    has no id: this never raises and never prompts. get_mount_point
+    exits the process when diskutil fails, which is why SystemExit is
+    caught here.
+
+    Args:
+        disk: /dev/diskN path.
+
+    Returns:
+        The id already on the card, or None.
+    """
+    try:
+        mount_point = get_mount_point(disk)
+        data = (Path(mount_point) / "OWN.TXT").read_bytes()
+    except (SystemExit, OSError, ValueError):
+        return None
+    return parse_own_txt(data)[1]
+
+
+def write_camera_side(mount_point: str, existing_id: str | None = None):
     """Ask which pages this camera shoots and write OWN.TXT.
 
     The file carries the page parity and a stable id for the body. An
     id already on the card is kept, so re-flashing a card does not
     change which camera the toolkit thinks it is.
+
+    Args:
+        mount_point: Where the card is mounted.
+        existing_id: Id read off the card before it was erased, if any.
+            Falls back to reading OWN.TXT here, for a card that was not
+            formatted in this run.
     """
     choice = input("Which pages does this camera shoot? [o]dd / [e]ven / [s]kip: ").strip().lower()
     if choice in ("o", "odd"):
@@ -208,11 +238,12 @@ def write_camera_side(mount_point: str):
         return
 
     own_txt = Path(mount_point) / "OWN.TXT"
-    camera_id = None
-    try:
-        camera_id = parse_own_txt(own_txt.read_bytes())[1]
-    except OSError:
-        camera_id = None
+    camera_id = existing_id
+    if not camera_id:
+        try:
+            camera_id = parse_own_txt(own_txt.read_bytes())[1]
+        except OSError:
+            camera_id = None
     if camera_id:
         origin = "kept the id already on the card"
     else:
@@ -233,12 +264,14 @@ def main():
     zip_path = download_chdk()
     disks = find_removable_disks()
     disk = pick_disk(disks)
+    # Salvage the body's identity before eraseDisk takes it away.
+    existing_id = read_existing_camera_id(disk)
     mount_point = format_card(disk)
     extract_chdk(zip_path, mount_point)
     patch_boot_sector(disk)
 
     mount_point = get_mount_point(disk)
-    write_camera_side(mount_point)
+    write_camera_side(mount_point, existing_id=existing_id)
     eject_card(disk)
     print("Done! Lock the SD card and insert into camera.")
 
