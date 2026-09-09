@@ -62,8 +62,30 @@ REMOTE_CAP_JPEG = 0x01
 REMOTE_CAP_RAW = 0x02
 REMOTE_CAP_DNG_HDR = 0x04
 
+# A full-resolution still needs a few hundred chunks at most; this only
+# exists so a camera that never clears the "more" flag cannot hang us.
+MAX_CAPTURE_CHUNKS = 10000
+
 
 ScriptMessage = namedtuple("ScriptMessage", ["msg_type", "data_type", "script_id", "value"])
+
+
+def _as_signed32(value):
+    """Reinterpret a PTP uint32 parameter as a signed 32-bit integer.
+
+    PTP parameters are unsigned, so CHDK's -1 sentinels arrive as
+    0xFFFFFFFF and have to be folded back before they are used.
+
+    Args:
+        value: Parameter value as received (unsigned).
+
+    Returns:
+        Integer in the range -2**31 .. 2**31 - 1.
+    """
+    value &= 0xFFFFFFFF
+    if value >= 0x80000000:
+        return value - 0x100000000
+    return value
 
 
 def _decode_script_value(data_type, data):
@@ -242,21 +264,74 @@ class ChdkPTP:
             return False, 0
         return True, params[0]
 
+    def remote_capture_get_chunk(self, format_flag):
+        """Fetch one chunk of a remote capture.
+
+        CHDK's PTP_CHDK_RemoteCaptureGetData handler (core/ptp.c)
+        answers one chunk per transaction and describes it in the
+        response parameters:
+
+          * param1 — the chunk's size in bytes;
+          * param2 — 1 while further chunks follow, 0 on the last one;
+          * param3 — the file position to seek to before writing this
+            chunk, or -1 to append. Parameters are unsigned, so -1
+            arrives as 0xFFFFFFFF and is folded back here.
+
+        A camera that sends fewer parameters is read as a single
+        appended chunk the size of the data phase.
+
+        Args:
+            format_flag: Which format to download (JPEG=1, RAW=2, DNG_HDR=4).
+
+        Returns:
+            Tuple of (chunk_bytes, more, position), where more is a bool
+            and position is a sign-corrected int (-1 means append).
+        """
+        params, data = self._session.transaction(
+            OperationCode.CHDK,
+            params=[ChdkCommand.REMOTE_CAPTURE_GET_DATA, format_flag],
+            receive_data=True,
+        )
+        params = params or []
+        size = params[0] if len(params) > 0 else len(data)
+        more = bool(params[1]) if len(params) > 1 else False
+        position = _as_signed32(params[2]) if len(params) > 2 else -1
+        # Trust the data phase when the camera claims more than it sent.
+        if 0 <= size < len(data):
+            data = data[:size]
+        return data, more, position
+
     def remote_capture_get_data(self, format_flag):
         """Download remote capture image data.
+
+        Loops over remote_capture_get_chunk until the camera clears its
+        "more" flag, placing each chunk at the position CHDK asks for.
+        A still larger than one chunk used to come back truncated.
 
         Args:
             format_flag: Which format to download (JPEG=1, RAW=2, DNG_HDR=4).
 
         Returns:
             Image data as bytes.
+
+        Raises:
+            RuntimeError: If the camera never clears its "more" flag.
         """
-        _, data = self._session.transaction(
-            OperationCode.CHDK,
-            params=[ChdkCommand.REMOTE_CAPTURE_GET_DATA, format_flag],
-            receive_data=True,
+        image = bytearray()
+        for _ in range(MAX_CAPTURE_CHUNKS):
+            chunk, more, position = self.remote_capture_get_chunk(format_flag)
+            if position >= 0:
+                end = position + len(chunk)
+                if len(image) < end:
+                    image.extend(bytes(end - len(image)))
+                image[position:end] = chunk
+            else:
+                image.extend(chunk)
+            if not more:
+                return bytes(image)
+        raise RuntimeError(
+            f"Remote capture did not end after {MAX_CAPTURE_CHUNKS} chunks"
         )
-        return data
 
     def wait_for_script(self, timeout=30.0):
         """Wait until no script is running on the camera."""

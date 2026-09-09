@@ -93,3 +93,85 @@ class TestDecodeScriptValue:
 
     def test_string(self):
         assert _decode_script_value(ScriptDataType.STRING, b"hello") == "hello"
+
+
+class TestRemoteCaptureGetData:
+    """Chunk assembly for PTP_CHDK_RemoteCaptureGetData."""
+
+    def _make_chdk(self):
+        mock_session = MagicMock()
+        return ChdkPTP(mock_session), mock_session
+
+    def test_two_chunks_are_joined_in_order(self):
+        chdk, session = self._make_chdk()
+        # [size, more, position]; position -1 means "append".
+        session.transaction.side_effect = [
+            ([4, 1, 0xFFFFFFFF], b"AAAA"),
+            ([4, 0, 0xFFFFFFFF], b"BBBB"),
+        ]
+        assert chdk.remote_capture_get_data(1) == b"AAAABBBB"
+        assert session.transaction.call_count == 2
+
+    def test_explicit_position_places_a_late_chunk_first(self):
+        chdk, session = self._make_chdk()
+        # Chunk B arrives first but belongs at offset 8.
+        session.transaction.side_effect = [
+            ([4, 1, 8], b"BBBB"),
+            ([8, 0, 0], b"AAAAAAAA"),
+        ]
+        assert chdk.remote_capture_get_data(1) == b"AAAAAAAABBBB"
+
+    def test_position_ffffffff_appends_instead_of_seeking(self):
+        chdk, session = self._make_chdk()
+        session.transaction.side_effect = [
+            ([2, 1, 0xFFFFFFFF], b"hi"),
+            ([5, 0, 0xFFFFFFFF], b"there"),
+        ]
+        assert chdk.remote_capture_get_data(1) == b"hithere"
+
+    def test_single_chunk_capture_is_returned_unchanged(self):
+        chdk, session = self._make_chdk()
+        session.transaction.side_effect = [
+            ([5, 0, 0xFFFFFFFF], b"\xff\xd8\xff\xe0\x00"),
+        ]
+        assert chdk.remote_capture_get_data(1) == b"\xff\xd8\xff\xe0\x00"
+
+    def test_camera_that_never_clears_more_raises(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = ([1, 1, 0xFFFFFFFF], b"x")
+        with pytest.raises(RuntimeError, match="10000"):
+            chdk.remote_capture_get_data(1)
+
+
+class TestRemoteCaptureGetChunk:
+    def _make_chdk(self):
+        mock_session = MagicMock()
+        return ChdkPTP(mock_session), mock_session
+
+    def test_reports_size_more_and_position(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = ([3, 1, 16], b"abc")
+        chunk, more, position = chdk.remote_capture_get_chunk(1)
+        assert chunk == b"abc"
+        assert more is True
+        assert position == 16
+
+    def test_short_params_mean_one_appended_chunk(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = ([], b"abc")
+        chunk, more, position = chdk.remote_capture_get_chunk(1)
+        assert chunk == b"abc"
+        assert more is False
+        assert position == -1
+
+    def test_size_smaller_than_the_data_phase_truncates(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = ([2, 0, 0xFFFFFFFF], b"abcd\x00\x00")
+        chunk, _, _ = chdk.remote_capture_get_chunk(1)
+        assert chunk == b"ab"
+
+    def test_size_larger_than_the_data_phase_keeps_what_arrived(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = ([64, 0, 0xFFFFFFFF], b"abcd")
+        chunk, _, _ = chdk.remote_capture_get_chunk(1)
+        assert chunk == b"abcd"
