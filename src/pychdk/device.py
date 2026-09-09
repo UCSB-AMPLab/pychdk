@@ -228,7 +228,18 @@ class ChdkDevice:
     def _shoot_streaming(self, setup_parts, dng):
         """Capture using remote capture (PTP commands 13/14).
 
+        Setup and shutter go out as one script, because a second script
+        kills the first unless NOKILL is set ("if script is running
+        return error instead of killing", core/ptp.h) — so a separate
+        shoot() could terminate the init_usb_capture that was still
+        running and leave the camera taking an ordinary card shot while
+        we waited for bytes that were never coming. The script returns
+        after the shutter, so the readiness poll below usually finds
+        the data waiting on its first pass.
+
         Raises:
+            RuntimeError: If the camera refuses to initialize remote
+                capture.
             NotImplementedError: If dng is True. CHDK's DNG_HDR flag
                 sends the DNG header only; the raw data is a separate
                 transfer, and the client has to splice the two into a
@@ -243,12 +254,20 @@ class ChdkDevice:
             )
 
         fmt = REMOTE_CAP_JPEG
-        script = "init_usb_capture({})".format(fmt)
-        for part in setup_parts:
-            script = part + "; " + script
-        self.lua_execute(script, do_return=False)
-
-        self.lua_execute("shoot()", do_return=False)
+        setup = "".join(part + "; " for part in setup_parts)
+        script = (
+            f"{setup}local ok = init_usb_capture({fmt}); "
+            "if ok == false then return false end; "
+            "shoot(); "
+            "return true"
+        )
+        # Only an explicit false is a refusal: an older CHDK returns
+        # nothing at all, and nil must not be read as failure.
+        if self.lua_execute(script, timeout=30) is False:
+            raise RuntimeError(
+                "The camera refused to initialize remote capture: "
+                "init_usb_capture returned false"
+            )
 
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:

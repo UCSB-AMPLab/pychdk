@@ -80,6 +80,32 @@ class TestChdkDevice:
         with pytest.raises(NotImplementedError, match="DNG"):
             dev.shoot(dng=True, stream=True)
 
+    def test_streaming_initializes_and_shoots_in_one_script(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_lua_wait.return_value = True
+        mock_chdk.remote_capture_is_ready.return_value = (True, 0x01)
+        mock_chdk.remote_capture_get_data.return_value = b"jpeg"
+        assert dev.shoot(stream=True) == b"jpeg"
+        # One script: a second one would kill the first, setup included.
+        assert mock_chdk.execute_lua_wait.call_count == 1
+        script = mock_chdk.execute_lua_wait.call_args[0][0]
+        assert "init_usb_capture" in script
+        assert "shoot()" in script
+
+    def test_streaming_raises_when_the_camera_refuses_to_initialize(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_lua_wait.return_value = False
+        with pytest.raises(RuntimeError, match="initialize remote capture"):
+            dev.shoot(stream=True)
+
+    def test_streaming_tolerates_a_camera_that_returns_nothing(self):
+        dev, mock_chdk = self._make_device()
+        # An older CHDK returns nil, which is not a refusal.
+        mock_chdk.execute_lua_wait.return_value = None
+        mock_chdk.remote_capture_is_ready.return_value = (True, 0x01)
+        mock_chdk.remote_capture_get_data.return_value = b"jpeg"
+        assert dev.shoot(stream=True) == b"jpeg"
+
     def test_streaming_asks_for_a_single_data_type(self):
         dev, mock_chdk = self._make_device()
         # JPEG and RAW both ready; the request parameter takes one bit.
