@@ -75,6 +75,11 @@ class TestChdkDevice:
         result = dev.download_file("A/OWN.TXT")
         assert result == b"EVEN\n"
 
+    def test_streamed_dng_is_refused(self):
+        dev, mock_chdk = self._make_device()
+        with pytest.raises(NotImplementedError, match="DNG"):
+            dev.shoot(dng=True, stream=True)
+
     def test_close(self):
         dev, mock_chdk = self._make_device()
         dev.close()

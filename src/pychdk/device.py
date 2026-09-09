@@ -226,11 +226,23 @@ class ChdkDevice:
             return self._shoot_standard(parts, download_after, remove_after)
 
     def _shoot_streaming(self, setup_parts, dng):
-        """Capture using remote capture (PTP commands 13/14)."""
-        fmt = REMOTE_CAP_JPEG
-        if dng:
-            fmt = REMOTE_CAP_RAW | REMOTE_CAP_DNG_HDR
+        """Capture using remote capture (PTP commands 13/14).
 
+        Raises:
+            NotImplementedError: If dng is True. CHDK's DNG_HDR flag
+                sends the DNG header only; the raw data is a separate
+                transfer, and the client has to splice the two into a
+                file. This method downloads one format, so it cannot.
+        """
+        if dng:
+            raise NotImplementedError(
+                "Streamed DNG is not supported: CHDK sends the DNG header "
+                "and the raw data as two separate transfers that the client "
+                "must assemble into a file. Capture DNG with stream=False, "
+                "or stream JPEG."
+            )
+
+        fmt = REMOTE_CAP_JPEG
         script = "init_usb_capture({})".format(fmt)
         for part in setup_parts:
             script = part + "; " + script
