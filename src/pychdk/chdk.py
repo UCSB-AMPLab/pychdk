@@ -428,10 +428,30 @@ class ChdkPTP:
         )
 
     def wait_for_script(self, timeout=30.0):
-        """Wait until no script is running on the camera."""
+        """Wait until no script is running on the camera.
+
+        Reads waiting messages as it goes, rather than watching only
+        the running flag: a script that starts and then fails clears
+        that flag like any other, so waiting without reading the queue
+        reported a failed capture as a clean one and left the error
+        behind for the next caller to trip over.
+
+        Args:
+            timeout: Max seconds to wait for the script to finish.
+
+        Raises:
+            RuntimeError: If the script reported an error.
+            TimeoutError: If the script is still running at the deadline.
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            running, _ = self.get_script_status()
+            running, has_msgs = self.get_script_status()
+            if has_msgs:
+                msg = self.read_script_message()
+                if msg.msg_type == MessageType.ERR:
+                    kind = _script_error_name(msg.data_type)
+                    raise RuntimeError(f"Script error ({kind}): {msg.value}")
+                continue
             if not running:
                 return
             time.sleep(0.5)

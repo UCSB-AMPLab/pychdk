@@ -186,6 +186,46 @@ class TestScriptStartupStatus:
         assert session.transaction.call_count == 2
 
 
+class TestWaitForScript:
+    """Waiting must notice a script that fails after it starts."""
+
+    def _make_chdk(self):
+        mock_session = MagicMock()
+        return ChdkPTP(mock_session), mock_session
+
+    def test_a_script_that_fails_after_starting_raises_with_its_text(self):
+        chdk, session = self._make_chdk()
+        session.transaction.side_effect = [
+            # running, message waiting
+            ([0b11], b""),
+            ([MessageType.ERR, ScriptErrorType.RUN, 7, 13],
+             b"shoot failed\x00"),
+        ]
+        with pytest.raises(RuntimeError, match="shoot failed"):
+            chdk.wait_for_script(timeout=5)
+
+    def test_a_clean_completion_still_returns(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = ([0], b"")
+        assert chdk.wait_for_script(timeout=5) is None
+
+    def test_a_return_message_is_not_an_error(self):
+        chdk, session = self._make_chdk()
+        session.transaction.side_effect = [
+            ([0b10], b""),  # not running, message waiting
+            ([MessageType.RET, ScriptDataType.INTEGER, 7, 4],
+             struct.pack("<i", 1)),
+            ([0], b""),     # nothing left
+        ]
+        assert chdk.wait_for_script(timeout=5) is None
+
+    def test_a_script_that_never_ends_still_times_out(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = ([0b01], b"")
+        with pytest.raises(TimeoutError):
+            chdk.wait_for_script(timeout=0.01)
+
+
 class TestDecodeScriptValue:
     def test_integer(self):
         data = struct.pack("<i", 42)
