@@ -322,18 +322,23 @@ class ChdkPTP:
 
         CHDK's PTP_CHDK_RemoteCaptureIsReady (core/ptp.h) returns a
         status in param1: 0 is not ready yet, 0x10000000 says remote
-        capture was never initialized, and any other value is a bitmask
-        of the PTP_CHDK_CAPTURE_* data types that are ready. The
-        uninitialized status is not a bitmask and must not be passed
-        back as one.
+        capture is not initialized, and any other value is a bitmask of
+        the PTP_CHDK_CAPTURE_* data types that are ready.
+
+        The uninitialized status is reported rather than raised on,
+        because on its own it does not mean anything is wrong. CHDK
+        acknowledges a script as loaded and scheduled, not as run, so a
+        poll can arrive before init_usb_capture has executed and get
+        this answer perfectly legitimately. It is a failure only once
+        the script has had its chance — which the caller knows and this
+        method does not. A caller seeing it after the script has ended
+        is looking at an initialization that never happened.
 
         Returns:
-            Tuple of (is_ready, formats), where formats is a bitmask of
-            the data types ready to download.
-
-        Raises:
-            RuntimeError: If the camera says remote capture was never
-                initialized.
+            Tuple of (is_ready, status). status is REMOTE_CAP_NOTSET
+            when the camera reports remote capture uninitialized, 0
+            when there is simply nothing ready yet, and otherwise a
+            bitmask of the data types ready to download.
         """
         params, _ = self._session.transaction(
             OperationCode.CHDK,
@@ -341,13 +346,8 @@ class ChdkPTP:
             receive_data=False,
         )
         status = params[0] if params else 0
-        if status == REMOTE_CAP_NOTSET:
-            raise RuntimeError(
-                "Remote capture is not initialized on the camera: "
-                "init_usb_capture must run before the shot"
-            )
-        if status == 0:
-            return False, 0
+        if status == 0 or status == REMOTE_CAP_NOTSET:
+            return False, status
         return True, status
 
     def remote_capture_get_chunk(self, format_flag):

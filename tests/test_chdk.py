@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pychdk.chdk import (
     ChdkPTP,
+    REMOTE_CAP_NOTSET,
     ChdkCommand,
     ScriptLanguage,
     ScriptDataType,
@@ -251,12 +252,13 @@ class TestRemoteCaptureIsReady:
         mock_session = MagicMock()
         return ChdkPTP(mock_session), mock_session
 
-    def test_uninitialized_capture_raises(self):
+    def test_uninitialized_is_reported_rather_than_raised(self):
         chdk, session = self._make_chdk()
         # 0x10000000 is PTP_CHDK_CAPTURE_NOTSET, not a data type bitmask.
+        # Only the caller knows whether the script has had its chance,
+        # so this reports the status instead of deciding on it.
         session.transaction.return_value = ([0x10000000], b"")
-        with pytest.raises(RuntimeError, match="init_usb_capture"):
-            chdk.remote_capture_is_ready()
+        assert chdk.remote_capture_is_ready() == (False, REMOTE_CAP_NOTSET)
 
     def test_status_zero_is_not_ready(self):
         chdk, session = self._make_chdk()

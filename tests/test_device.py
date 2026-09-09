@@ -9,6 +9,7 @@ import pychdk
 from pychdk import device
 from pychdk.chdk import (
     MessageType,
+    REMOTE_CAP_NOTSET,
     ScriptDataType,
     ScriptErrorType,
     ScriptMessage,
@@ -159,6 +160,58 @@ class TestChdkDevice:
         )
         mock_chdk.remote_capture_get_data.return_value = b"jpeg"
         assert dev.shoot(stream=True) == b"jpeg"
+
+    def test_an_early_not_initialized_poll_is_not_a_failure(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 7
+        # CHDK acknowledges a script as scheduled, not as run, so the
+        # first poll can land before init_usb_capture has executed.
+        mock_chdk.remote_capture_is_ready.side_effect = [
+            (False, REMOTE_CAP_NOTSET),
+            (True, 0x01),
+        ]
+        mock_chdk.get_script_status.return_value = (True, False)
+        mock_chdk.remote_capture_get_data.return_value = b"jpeg"
+        assert dev.shoot(stream=True) == b"jpeg"
+
+    def test_not_initialized_after_the_script_ended_is_a_failure(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 7
+        mock_chdk.remote_capture_is_ready.return_value = (
+            False, REMOTE_CAP_NOTSET,
+        )
+        mock_chdk.get_script_status.return_value = (False, False)
+        with pytest.raises(RuntimeError, match="never initialized"):
+            dev.shoot(stream=True)
+        assert mock_chdk.remote_capture_is_ready.call_count == 1
+
+    def test_an_initialization_failure_beats_the_early_status(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 7
+        # The status arrives first, but the script's own false is the
+        # better answer and must be the one reported.
+        mock_chdk.remote_capture_is_ready.return_value = (
+            False, REMOTE_CAP_NOTSET,
+        )
+        mock_chdk.get_script_status.return_value = (True, True)
+        mock_chdk.read_script_message.return_value = ScriptMessage(
+            MessageType.RET, ScriptDataType.BOOLEAN, 7, False,
+        )
+        with pytest.raises(RuntimeError, match="refused to initialize"):
+            dev.shoot(stream=True)
+
+    def test_a_script_error_beats_the_early_status(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 7
+        mock_chdk.remote_capture_is_ready.return_value = (
+            False, REMOTE_CAP_NOTSET,
+        )
+        mock_chdk.get_script_status.return_value = (True, True)
+        mock_chdk.read_script_message.return_value = ScriptMessage(
+            MessageType.ERR, ScriptErrorType.RUN, 7, "no such function",
+        )
+        with pytest.raises(RuntimeError, match="no such function"):
+            dev.shoot(stream=True)
 
     def test_streaming_stops_when_the_script_ends_without_a_capture(self):
         dev, mock_chdk = self._make_device()

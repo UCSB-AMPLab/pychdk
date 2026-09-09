@@ -16,10 +16,18 @@ from pychdk.chdk import (
     ChdkPTP,
     MessageType,
     REMOTE_CAP_JPEG,
+    REMOTE_CAP_NOTSET,
     REMOTE_CAP_RAW,
     REMOTE_CAP_DNG_HDR,
 )
 from pychdk.util import shutter_to_tv96, iso_to_sv96
+
+
+# How long a capture script is allowed to still be starting before an
+# "uninitialized" answer counts against it. CHDK acknowledges a script
+# as scheduled, not as run, so the first polls can legitimately land
+# before init_usb_capture has executed.
+CAPTURE_INIT_GRACE = 5.0
 
 
 DeviceInfo = namedtuple("DeviceInfo", [
@@ -271,8 +279,10 @@ class ChdkDevice:
 
         image = None
         deadline = time.monotonic() + 30
+        init_deadline = time.monotonic() + CAPTURE_INIT_GRACE
         while time.monotonic() < deadline:
-            ready, formats = self._chdk.remote_capture_is_ready()
+            ready, status = self._chdk.remote_capture_is_ready()
+            formats = status
             if ready:
                 # A mask without the format we asked for is a fault, not
                 # a menu: the other bits are a different picture.
@@ -299,6 +309,16 @@ class ChdkDevice:
                             "capture: init_usb_capture returned false"
                         )
                 continue
+
+            # Checked after the queue, so a script that explained itself
+            # is reported by its own words rather than by this status.
+            if status == REMOTE_CAP_NOTSET and (
+                not running or time.monotonic() >= init_deadline
+            ):
+                raise RuntimeError(
+                    "The camera never initialized remote capture: "
+                    "init_usb_capture did not take effect"
+                )
             if not running:
                 raise RuntimeError(
                     "The capture script finished without producing a capture"
