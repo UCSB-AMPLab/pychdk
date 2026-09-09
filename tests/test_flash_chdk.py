@@ -1,5 +1,7 @@
 """The flasher must not change a body's identity when a card is re-flashed."""
 import importlib.util
+import plistlib
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -7,6 +9,64 @@ import pytest
 from pychdk.util import parse_own_txt
 
 TOOL = Path(__file__).resolve().parent.parent / "tools" / "flash_chdk.py"
+
+# Real `diskutil list -plist` output, captured on macOS 15 from a disk
+# with a GUID partition scheme. The shapes below are taken from it:
+# AllDisksAndPartitions holds whole disks, each with a Content naming
+# the partition scheme and a Partitions list (APFS containers add
+# APFSVolumes). A genuinely blank card — no partition map at all —
+# could not be captured here, since it needs an SD card in a reader;
+# _blank_layout() is this structure with the layout emptied, and the
+# real thing is still worth one check at the bench.
+PARTITIONED_LAYOUT = {
+    "AllDisks": ["disk4", "disk4s1"],
+    "AllDisksAndPartitions": [
+        {
+            "Content": "GUID_partition_scheme",
+            "DeviceIdentifier": "disk4",
+            "OSInternal": False,
+            "Partitions": [
+                {
+                    "Content": "Apple_HFS",
+                    "DeviceIdentifier": "disk4s1",
+                    "DiskUUID": "12EEA754-2CA1-4EA7-A1B4-54DF40936F21",
+                    "Size": 15931539456,
+                },
+            ],
+            "Size": 15931539456,
+        },
+    ],
+    "VolumesFromDisks": [],
+    "WholeDisks": ["disk4"],
+}
+
+
+def _blank_layout():
+    """PARTITIONED_LAYOUT with no partition map and no filesystem."""
+    return {
+        "AllDisks": ["disk4"],
+        "AllDisksAndPartitions": [
+            {
+                "Content": "",
+                "DeviceIdentifier": "disk4",
+                "OSInternal": False,
+                "Size": 15931539456,
+            },
+        ],
+        "VolumesFromDisks": [],
+        "WholeDisks": ["disk4"],
+    }
+
+
+def _fake_run(layout=None, returncode=0, stdout=None):
+    """Stand in for _run, answering `diskutil list -plist` with a plist."""
+    if stdout is None:
+        stdout = plistlib.dumps(layout).decode() if layout else ""
+
+    def run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, returncode, stdout, "")
+
+    return run
 
 
 def _load_tool():
@@ -130,7 +190,7 @@ class TestCameraIdSurvivesAReflash:
             raise SystemExit(1)
 
         monkeypatch.setattr(tool, "get_mount_point", refuse)
-        monkeypatch.setattr(tool, "_card_holds_a_volume", lambda disk: False)
+        monkeypatch.setattr(tool, "_run", _fake_run(_blank_layout()))
         assert tool.read_existing_own_txt("/dev/disk9") == (None, None)
         assert "blank" in capsys.readouterr().out
 
@@ -144,7 +204,7 @@ class TestCameraIdSurvivesAReflash:
 
         monkeypatch.setattr(tool, "get_mount_point", refuse)
         # diskutil says there is a filesystem, but it would not mount.
-        monkeypatch.setattr(tool, "_card_holds_a_volume", lambda disk: True)
+        monkeypatch.setattr(tool, "_run", _fake_run(PARTITIONED_LAYOUT))
         with pytest.raises(SystemExit):
             tool.read_existing_own_txt("/dev/disk9")
         assert "could not be inspected" in capsys.readouterr().out
@@ -162,7 +222,7 @@ class TestCameraIdSurvivesAReflash:
         monkeypatch.setattr(tool, "find_removable_disks", lambda: [])
         monkeypatch.setattr(tool, "pick_disk", lambda disks: "/dev/disk9")
         monkeypatch.setattr(tool, "get_mount_point", refuse)
-        monkeypatch.setattr(tool, "_card_holds_a_volume", lambda disk: True)
+        monkeypatch.setattr(tool, "_run", _fake_run(PARTITIONED_LAYOUT))
         monkeypatch.setattr(
             tool, "format_card", lambda disk: formatted.append(disk),
         )
@@ -170,12 +230,67 @@ class TestCameraIdSurvivesAReflash:
             tool.main()
         assert formatted == []
 
+    def test_a_layout_that_cannot_be_inspected_stops_the_run(
+        self, monkeypatch,
+    ):
+        tool = _load_tool()
+
+        def refuse(disk):
+            raise SystemExit(1)
+
+        monkeypatch.setattr(tool, "get_mount_point", refuse)
+        # diskutil itself failed: the card is not demonstrably blank.
+        monkeypatch.setattr(tool, "_run", _fake_run(returncode=1))
+        with pytest.raises(SystemExit):
+            tool.read_existing_own_txt("/dev/disk4")
+
+    def test_unparseable_layout_stops_the_run(self, monkeypatch):
+        tool = _load_tool()
+
+        def refuse(disk):
+            raise SystemExit(1)
+
+        monkeypatch.setattr(tool, "get_mount_point", refuse)
+        monkeypatch.setattr(tool, "_run", _fake_run(stdout="not a plist"))
+        with pytest.raises(SystemExit):
+            tool.read_existing_own_txt("/dev/disk4")
+
+    def test_an_apfs_container_counts_as_a_filesystem(self, monkeypatch):
+        tool = _load_tool()
+        layout = {
+            "AllDisksAndPartitions": [
+                {
+                    "Content": "Apple_APFS_Container",
+                    "DeviceIdentifier": "disk4",
+                    "APFSVolumes": [{"DeviceIdentifier": "disk4s1"}],
+                    "Partitions": [],
+                },
+            ],
+        }
+        monkeypatch.setattr(tool, "_run", _fake_run(layout))
+        assert tool._classify_card("/dev/disk4") == tool.CARD_HAS_FILESYSTEM
+
+    def test_a_blank_layout_is_classified_blank(self, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(tool, "_run", _fake_run(_blank_layout()))
+        assert tool._classify_card("/dev/disk4") == tool.CARD_BLANK
+
+    def test_a_partitioned_layout_holds_a_filesystem(self, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(tool, "_run", _fake_run(PARTITIONED_LAYOUT))
+        assert tool._classify_card("/dev/disk4") == tool.CARD_HAS_FILESYSTEM
+
+    def test_an_empty_layout_list_is_unknown_not_blank(self, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(tool, "_run", _fake_run({"AllDisksAndPartitions": []}))
+        assert tool._classify_card("/dev/disk4") == tool.CARD_UNKNOWN
+
     def test_a_mounted_card_with_no_own_txt_has_no_id(
         self, tmp_path, monkeypatch,
     ):
         tool = _load_tool()
         monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
-        monkeypatch.setattr(tool, "_card_holds_a_volume", lambda disk: True)
+        monkeypatch.setattr(tool, "_run", _fake_run(PARTITIONED_LAYOUT))
         assert tool.read_existing_own_txt("/dev/disk9") == (None, None)
 
     def test_an_unreadable_own_txt_stops_rather_than_reporting_no_id(

@@ -200,21 +200,58 @@ def _mounted_path(disk: str) -> str | None:
         return None
 
 
-def _card_holds_a_volume(disk: str) -> bool:
-    """Ask diskutil whether the card has a first partition at all.
+CARD_BLANK = "blank"
+CARD_HAS_FILESYSTEM = "filesystem"
+CARD_UNKNOWN = "unknown"
 
-    diskutil info exits nonzero for a partition that does not exist, so
-    a card with no filesystem answers False here. That is the only
-    card safe to erase without looking at it first.
+
+def _entry_holds_a_filesystem(entry: dict) -> bool:
+    """Whether one diskutil layout entry describes anything mountable."""
+    if entry.get("Content"):
+        return True
+    return bool(entry.get("Partitions") or entry.get("APFSVolumes"))
+
+
+def _classify_card(disk: str) -> str:
+    """Ask diskutil what the whole card holds.
+
+    Inspecting one partition cannot answer this: an existing but
+    unformatted diskNs1 reports fine and then will not mount, and a
+    diskNs1 that is missing does not prove the card is empty, since the
+    filesystem may be on the whole device or on another partition. So
+    read the layout of the whole device and judge from every entry in
+    it. `diskutil list -plist` returns AllDisksAndPartitions, whose
+    entries carry a Content naming the partition scheme or filesystem
+    and, when there is one, a Partitions or APFSVolumes list.
+
+    Anything we cannot read or cannot understand is CARD_UNKNOWN, never
+    CARD_BLANK: only a layout that positively shows an empty card is
+    safe to erase without looking first.
 
     Args:
         disk: /dev/diskN path.
 
     Returns:
-        True if the card reports a volume, False if it holds none.
+        CARD_BLANK, CARD_HAS_FILESYSTEM or CARD_UNKNOWN.
     """
-    result = _run(["diskutil", "info", "-plist", disk + "s1"], check=False)
-    return result.returncode == 0
+    result = _run(["diskutil", "list", "-plist", disk], check=False)
+    if result.returncode != 0:
+        return CARD_UNKNOWN
+    try:
+        layout = plistlib.loads(result.stdout.encode())
+    except Exception:
+        return CARD_UNKNOWN
+    entries = layout.get("AllDisksAndPartitions")
+    if not entries:
+        # diskutil succeeded but told us nothing about this disk.
+        return CARD_UNKNOWN
+    for entry in entries:
+        if _entry_holds_a_filesystem(entry):
+            return CARD_HAS_FILESYSTEM
+        for part in entry.get("Partitions", []) + entry.get("APFSVolumes", []):
+            if _entry_holds_a_filesystem(part):
+                return CARD_HAS_FILESYSTEM
+    return CARD_BLANK
 
 
 def read_existing_own_txt(disk: str) -> tuple[str | None, str | None]:
@@ -247,14 +284,15 @@ def read_existing_own_txt(disk: str) -> tuple[str | None, str | None]:
     """
     mount_point = _mounted_path(disk)
     if mount_point is None:
-        if not _card_holds_a_volume(disk):
+        if _classify_card(disk) == CARD_BLANK:
             print("Card holds no filesystem; treating it as blank.")
             return None, None
         print(
-            "The card holds a filesystem that could not be inspected. "
-            "Stopping before it is erased: it may carry a camera id, "
-            "and formatting would lose that body's identity. Check the "
-            "card and the reader, then run this again."
+            "The card holds a filesystem that could not be inspected, "
+            "or its layout could not be read at all. Stopping before it "
+            "is erased: it may carry a camera id, and formatting would "
+            "lose that body's identity. Check the card and the reader, "
+            "then run this again."
         )
         sys.exit(1)
 
