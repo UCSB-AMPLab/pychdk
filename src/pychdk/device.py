@@ -252,9 +252,11 @@ class ChdkDevice:
 
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            ready, img_fmt = self._chdk.remote_capture_is_ready()
+            ready, formats = self._chdk.remote_capture_is_ready()
             if ready:
-                return self._chdk.remote_capture_get_data(img_fmt)
+                # The request parameter is one bit, not the whole mask.
+                data_type = fmt if formats & fmt else formats & -formats
+                return self._chdk.remote_capture_get_data(data_type)
             time.sleep(0.1)
         raise TimeoutError("Remote capture did not complete")
 

@@ -95,6 +95,29 @@ class TestDecodeScriptValue:
         assert _decode_script_value(ScriptDataType.STRING, b"hello") == "hello"
 
 
+class TestRemoteCaptureIsReady:
+    def _make_chdk(self):
+        mock_session = MagicMock()
+        return ChdkPTP(mock_session), mock_session
+
+    def test_uninitialized_capture_raises(self):
+        chdk, session = self._make_chdk()
+        # 0x10000000 is PTP_CHDK_CAPTURE_NOTSET, not a data type bitmask.
+        session.transaction.return_value = ([0x10000000], b"")
+        with pytest.raises(RuntimeError, match="init_usb_capture"):
+            chdk.remote_capture_is_ready()
+
+    def test_status_zero_is_not_ready(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = ([0], b"")
+        assert chdk.remote_capture_is_ready() == (False, 0)
+
+    def test_a_nonzero_status_is_the_ready_bitmask(self):
+        chdk, session = self._make_chdk()
+        session.transaction.return_value = ([0x03], b"")
+        assert chdk.remote_capture_is_ready() == (True, 0x03)
+
+
 class TestRemoteCaptureGetData:
     """Chunk assembly for PTP_CHDK_RemoteCaptureGetData."""
 

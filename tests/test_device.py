@@ -80,6 +80,29 @@ class TestChdkDevice:
         with pytest.raises(NotImplementedError, match="DNG"):
             dev.shoot(dng=True, stream=True)
 
+    def test_streaming_asks_for_a_single_data_type(self):
+        dev, mock_chdk = self._make_device()
+        # JPEG and RAW both ready; the request parameter takes one bit.
+        mock_chdk.remote_capture_is_ready.return_value = (True, 0x03)
+        mock_chdk.remote_capture_get_data.return_value = b"jpeg"
+        assert dev.shoot(stream=True) == b"jpeg"
+        mock_chdk.remote_capture_get_data.assert_called_once_with(1)
+
+    def test_streaming_falls_back_to_the_lowest_ready_bit(self):
+        dev, mock_chdk = self._make_device()
+        # No JPEG on offer: RAW (0x2) and DNG header (0x4).
+        mock_chdk.remote_capture_is_ready.return_value = (True, 0x06)
+        mock_chdk.remote_capture_get_data.return_value = b"raw"
+        assert dev.shoot(stream=True) == b"raw"
+        mock_chdk.remote_capture_get_data.assert_called_once_with(2)
+
+    def test_streaming_jpeg_is_unchanged(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.remote_capture_is_ready.return_value = (True, 0x01)
+        mock_chdk.remote_capture_get_data.return_value = b"jpeg"
+        assert dev.shoot(stream=True) == b"jpeg"
+        mock_chdk.remote_capture_get_data.assert_called_once_with(1)
+
     def test_close(self):
         dev, mock_chdk = self._make_device()
         dev.close()

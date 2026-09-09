@@ -62,6 +62,10 @@ REMOTE_CAP_JPEG = 0x01
 REMOTE_CAP_RAW = 0x02
 REMOTE_CAP_DNG_HDR = 0x04
 
+# Not a data type: the status PTP_CHDK_RemoteCaptureIsReady reports when
+# init_usb_capture has not run (PTP_CHDK_CAPTURE_NOTSET in core/ptp.h).
+REMOTE_CAP_NOTSET = 0x10000000
+
 # A full-resolution still needs a few hundred chunks at most; this only
 # exists so a camera that never clears the "more" flag cannot hang us.
 MAX_CAPTURE_CHUNKS = 10000
@@ -252,17 +256,35 @@ class ChdkPTP:
     def remote_capture_is_ready(self):
         """Check if a remote capture is ready for download.
 
+        CHDK's PTP_CHDK_RemoteCaptureIsReady (core/ptp.h) returns a
+        status in param1: 0 is not ready yet, 0x10000000 says remote
+        capture was never initialized, and any other value is a bitmask
+        of the PTP_CHDK_CAPTURE_* data types that are ready. The
+        uninitialized status is not a bitmask and must not be passed
+        back as one.
+
         Returns:
-            Tuple of (is_ready, image_format).
+            Tuple of (is_ready, formats), where formats is a bitmask of
+            the data types ready to download.
+
+        Raises:
+            RuntimeError: If the camera says remote capture was never
+                initialized.
         """
         params, _ = self._session.transaction(
             OperationCode.CHDK,
             params=[ChdkCommand.REMOTE_CAPTURE_IS_READY],
             receive_data=False,
         )
-        if not params or params[0] == 0:
+        status = params[0] if params else 0
+        if status == REMOTE_CAP_NOTSET:
+            raise RuntimeError(
+                "Remote capture is not initialized on the camera: "
+                "init_usb_capture must run before the shot"
+            )
+        if status == 0:
             return False, 0
-        return True, params[0]
+        return True, status
 
     def remote_capture_get_chunk(self, format_flag):
         """Fetch one chunk of a remote capture.
