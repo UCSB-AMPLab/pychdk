@@ -273,9 +273,12 @@ class ChdkPTP:
 
           * param1 — the chunk's size in bytes;
           * param2 — 1 while further chunks follow, 0 on the last one;
-          * param3 — the file position to seek to before writing this
-            chunk, or -1 to append. Parameters are unsigned, so -1
-            arrives as 0xFFFFFFFF and is folded back here.
+          * param3 — "seek required to pos (-1 = no seek)", in the
+            header's words. No seek means the chunk continues from the
+            current write position, which is not the same as the end of
+            the file once a chunk has seeked backwards. Parameters are
+            unsigned, so -1 arrives as 0xFFFFFFFF and is folded back
+            here.
 
         A camera that sends fewer parameters is read as a single
         appended chunk the size of the data phase.
@@ -285,7 +288,7 @@ class ChdkPTP:
 
         Returns:
             Tuple of (chunk_bytes, more, position), where more is a bool
-            and position is a sign-corrected int (-1 means append).
+            and position is a sign-corrected int (-1 means no seek).
         """
         params, data = self._session.transaction(
             OperationCode.CHDK,
@@ -305,8 +308,12 @@ class ChdkPTP:
         """Download remote capture image data.
 
         Loops over remote_capture_get_chunk until the camera clears its
-        "more" flag, placing each chunk at the position CHDK asks for.
-        A still larger than one chunk used to come back truncated.
+        "more" flag, following the same write cursor a file would. A
+        chunk that asks for a seek moves the cursor; every chunk is
+        written at the cursor and advances it by its own length. That
+        is what "-1 = no seek" means: the chunk continues from wherever
+        the last one ended, which is only the end of the file while no
+        chunk has seeked backwards.
 
         Args:
             format_flag: Which format to download (JPEG=1, RAW=2, DNG_HDR=4).
@@ -318,15 +325,16 @@ class ChdkPTP:
             RuntimeError: If the camera never clears its "more" flag.
         """
         image = bytearray()
+        cursor = 0
         for _ in range(MAX_CAPTURE_CHUNKS):
             chunk, more, position = self.remote_capture_get_chunk(format_flag)
             if position >= 0:
-                end = position + len(chunk)
-                if len(image) < end:
-                    image.extend(bytes(end - len(image)))
-                image[position:end] = chunk
-            else:
-                image.extend(chunk)
+                cursor = position
+            end = cursor + len(chunk)
+            if len(image) < end:
+                image.extend(bytes(end - len(image)))
+            image[cursor:end] = chunk
+            cursor = end
             if not more:
                 return bytes(image)
         raise RuntimeError(

@@ -121,7 +121,7 @@ class TestRemoteCaptureGetData:
         ]
         assert chdk.remote_capture_get_data(1) == b"AAAAAAAABBBB"
 
-    def test_position_ffffffff_appends_instead_of_seeking(self):
+    def test_position_ffffffff_is_no_seek_not_a_huge_offset(self):
         chdk, session = self._make_chdk()
         session.transaction.side_effect = [
             ([2, 1, 0xFFFFFFFF], b"hi"),
@@ -135,6 +135,27 @@ class TestRemoteCaptureGetData:
             ([5, 0, 0xFFFFFFFF], b"\xff\xd8\xff\xe0\x00"),
         ]
         assert chdk.remote_capture_get_data(1) == b"\xff\xd8\xff\xe0\x00"
+
+    def test_an_unseeked_chunk_continues_from_the_write_cursor(self):
+        chdk, session = self._make_chdk()
+        # CHDK seeks back to 0 to rewrite the first two bytes; the chunk
+        # after it carries no seek, so it continues from byte 2 — not
+        # from the end of what has been written so far.
+        session.transaction.side_effect = [
+            ([8, 1, 0], b"ABCDEFGH"),
+            ([2, 1, 0], b"xy"),
+            ([2, 0, 0xFFFFFFFF], b"zw"),
+        ]
+        assert chdk.remote_capture_get_data(1) == b"xyzwEFGH"
+
+    def test_a_forward_seek_leaves_a_zero_filled_gap(self):
+        chdk, session = self._make_chdk()
+        session.transaction.side_effect = [
+            ([2, 1, 0], b"AB"),
+            ([2, 1, 6], b"CD"),
+            ([2, 0, 0xFFFFFFFF], b"EF"),
+        ]
+        assert chdk.remote_capture_get_data(1) == b"AB\x00\x00\x00\x00CDEF"
 
     def test_camera_that_never_clears_more_raises(self):
         chdk, session = self._make_chdk()
