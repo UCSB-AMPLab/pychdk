@@ -217,7 +217,10 @@ def write_camera_side(mount_point: str, existing_id: str | None = None):
 
     The file carries the page parity and a stable id for the body. An
     id already on the card is kept, so re-flashing a card does not
-    change which camera the toolkit thinks it is.
+    change which camera the toolkit thinks it is — including when the
+    operator declines to set a parity, since the card has already been
+    erased by then and skipping would otherwise throw the rescued id
+    away. A card with neither parity nor id has nothing worth writing.
 
     Args:
         mount_point: Where the card is mounted.
@@ -232,10 +235,10 @@ def write_camera_side(mount_point: str, existing_id: str | None = None):
         side = "EVEN"
     elif choice in ("s", "skip", ""):
         print("Skipping camera side assignment.")
-        return
+        side = None
     else:
         print(f"Unknown choice '{choice}', skipping.")
-        return
+        side = None
 
     own_txt = Path(mount_point) / "OWN.TXT"
     camera_id = existing_id
@@ -246,12 +249,15 @@ def write_camera_side(mount_point: str, existing_id: str | None = None):
             camera_id = None
     if camera_id:
         origin = "kept the id already on the card"
-    else:
+    elif side:
         camera_id = secrets.token_hex(6)
         origin = "minted a new id"
+    else:
+        # No parity to record and no identity to preserve.
+        return
 
     own_txt.write_text(format_own_txt(side, camera_id))
-    print(f"Wrote OWN.TXT ({side}, id={camera_id}) — {origin}")
+    print(f"Wrote OWN.TXT ({side or 'no parity'}, id={camera_id}) — {origin}")
 
 
 def eject_card(disk: str):

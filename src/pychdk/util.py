@@ -124,16 +124,25 @@ def format_own_txt(side, camera_id=None):
     """Render the canonical OWN.TXT for a page parity and camera id.
 
     The parity is which pages the body shoots, ODD or EVEN, not a side
-    of the table. The id line is written only when an id is given.
+    of the table. Each line is written only when there is something to
+    put on it: an id with no parity is a valid file, since a body keeps
+    its identity whether or not an operator has decided which pages it
+    shoots, and parse_own_txt reads it back. With neither, there is
+    nothing to record and the result is empty.
 
     Args:
-        side: 'ODD' or 'EVEN', in any case.
+        side: 'ODD' or 'EVEN', in any case, or None for no parity.
         camera_id: Stable hex identity for the body, or None.
 
     Returns:
-        File contents as a str, with a single trailing newline.
+        File contents as a str with a single trailing newline, or an
+        empty string when there is nothing to write.
     """
-    lines = [str(side).strip().upper()]
+    lines = []
+    if side:
+        lines.append(str(side).strip().upper())
     if camera_id:
         lines.append("id=" + str(camera_id).strip())
+    if not lines:
+        return ""
     return "\n".join(lines) + "\n"

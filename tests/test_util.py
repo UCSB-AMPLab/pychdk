@@ -136,6 +136,16 @@ class TestFormatOwnTxt:
     def test_parity_is_uppercased(self):
         assert format_own_txt("even", "abc123def456") == "EVEN\nid=abc123def456\n"
 
+    def test_an_id_alone_needs_no_parity(self):
+        assert format_own_txt(None, "3f9a1c2b7d4e") == "id=3f9a1c2b7d4e\n"
+
+    def test_nothing_to_say_writes_nothing(self):
+        assert format_own_txt(None, None) == ""
+
+    def test_round_trip_of_an_id_without_a_parity(self):
+        text = format_own_txt(None, "3f9a1c2b7d4e")
+        assert parse_own_txt(text) == (None, "3f9a1c2b7d4e")
+
     def test_round_trip(self):
         text = format_own_txt("odd", "3f9a1c2b7d4e")
         assert parse_own_txt(text) == ("ODD", "3f9a1c2b7d4e")

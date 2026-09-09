@@ -72,6 +72,31 @@ class TestCameraIdSurvivesAReflash:
         assert camera_id is not None
         assert "minted" in capsys.readouterr().out
 
+    def test_skipping_parity_still_writes_the_id_back(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        tool = _load_tool()
+        monkeypatch.setattr("builtins.input", lambda prompt="": "s")
+        tool.write_camera_side(str(tmp_path), existing_id="abc123def456")
+        assert (tmp_path / "OWN.TXT").read_text() == "id=abc123def456\n"
+        assert "kept" in capsys.readouterr().out
+
+    def test_an_unrecognized_answer_still_writes_the_id_back(
+        self, tmp_path, monkeypatch,
+    ):
+        tool = _load_tool()
+        monkeypatch.setattr("builtins.input", lambda prompt="": "banana")
+        tool.write_camera_side(str(tmp_path), existing_id="abc123def456")
+        assert (tmp_path / "OWN.TXT").read_text() == "id=abc123def456\n"
+
+    def test_skipping_parity_with_no_id_writes_nothing(
+        self, tmp_path, monkeypatch,
+    ):
+        tool = _load_tool()
+        monkeypatch.setattr("builtins.input", lambda prompt="": "s")
+        tool.write_camera_side(str(tmp_path))
+        assert not (tmp_path / "OWN.TXT").exists()
+
     def test_reading_an_id_from_an_unusable_card_is_quiet(self, monkeypatch):
         tool = _load_tool()
 
