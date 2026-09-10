@@ -420,16 +420,21 @@ class TestCameraIdSurvivesAReflash:
         with pytest.raises(SystemExit):
             tool.read_existing_own_txt("/dev/disk4")
 
-    def test_an_apfs_container_counts_as_a_filesystem(self, monkeypatch):
+    def test_a_nested_volume_with_no_content_is_still_a_filesystem(
+        self, monkeypatch,
+    ):
         tool = _load_tool()
-        # Captured shape: an APFS volume has no Content of its own, so
-        # it has to be recognized by its name and mount point.
+        # The parent carries nothing but a scheme, so the nested volume
+        # is the only thing that can decide. Real APFS volumes have no
+        # Content of their own and name themselves instead; without the
+        # name and mount-point checks this classifies as blank.
         layout = {
             "AllDisksAndPartitions": [
                 {
-                    "Content": "Apple_APFS_Container",
+                    "Content": "GUID_partition_scheme",
                     "DeviceIdentifier": "disk4",
                     "Size": 15931539456,
+                    "Partitions": [],
                     "APFSVolumes": [
                         {
                             "DeviceIdentifier": "disk4s1",
@@ -438,12 +443,39 @@ class TestCameraIdSurvivesAReflash:
                             "Size": 15931539456,
                         },
                     ],
-                    "Partitions": [],
                 },
             ],
         }
         monkeypatch.setattr(tool, "_run", _fake_run(layout))
         assert tool._classify_card("/dev/disk4") == tool.CARD_HAS_FILESYSTEM
+
+    def test_an_apfs_container_on_the_whole_disk_is_a_filesystem(
+        self, monkeypatch,
+    ):
+        tool = _load_tool()
+        # The parent-level case, separated out: Apple_APFS_Container is
+        # not a partition scheme, so the entry decides on its own and
+        # the nested volumes are never reached.
+        layout = {
+            "AllDisksAndPartitions": [
+                {
+                    "Content": "Apple_APFS_Container",
+                    "DeviceIdentifier": "disk4",
+                    "Size": 15931539456,
+                },
+            ],
+        }
+        monkeypatch.setattr(tool, "_run", _fake_run(layout))
+        assert tool._classify_card("/dev/disk4") == tool.CARD_HAS_FILESYSTEM
+
+    def test_a_volume_is_judged_by_name_or_mount_point_or_content(self):
+        tool = _load_tool()
+        assert tool._volume_holds_a_filesystem({"VolumeName": "Card"})
+        assert tool._volume_holds_a_filesystem({"MountPoint": "/Volumes/Card"})
+        assert tool._volume_holds_a_filesystem({"Content": "DOS_FAT_32"})
+        assert not tool._volume_holds_a_filesystem(
+            {"DeviceIdentifier": "disk4s1", "Size": 1},
+        )
 
     def test_a_blank_layout_is_classified_blank(self, monkeypatch):
         tool = _load_tool()
