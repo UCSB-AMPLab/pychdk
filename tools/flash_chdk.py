@@ -205,11 +205,34 @@ CARD_HAS_FILESYSTEM = "filesystem"
 CARD_UNKNOWN = "unknown"
 
 
+# The keys every whole-disk entry of `diskutil list -plist` carries,
+# captured from real output. An entry without them is not a shape we
+# recognize, and an unrecognized shape is never called blank.
+_WHOLE_DISK_KEYS = frozenset({"Content", "DeviceIdentifier", "Size"})
+
+
+def _disk_identifier(disk: str) -> str:
+    """Reduce /dev/diskN to the diskN that diskutil reports."""
+    return disk.rsplit("/", 1)[-1]
+
+
 def _entry_holds_a_filesystem(entry: dict) -> bool:
     """Whether one diskutil layout entry describes anything mountable."""
     if entry.get("Content"):
         return True
     return bool(entry.get("Partitions") or entry.get("APFSVolumes"))
+
+
+def _entry_is_recognizably_blank(entry: dict) -> bool:
+    """Whether an entry positively shows a device with nothing on it.
+
+    Being unable to find a filesystem is not the same as finding none:
+    an empty entry, or one made of keys we do not know, says nothing
+    about the card and must not be read as saying it is empty.
+    """
+    if not _WHOLE_DISK_KEYS.issubset(entry):
+        return False
+    return not _entry_holds_a_filesystem(entry)
 
 
 def _classify_card(disk: str) -> str:
@@ -224,9 +247,12 @@ def _classify_card(disk: str) -> str:
     entries carry a Content naming the partition scheme or filesystem
     and, when there is one, a Partitions or APFSVolumes list.
 
-    Anything we cannot read or cannot understand is CARD_UNKNOWN, never
-    CARD_BLANK: only a layout that positively shows an empty card is
-    safe to erase without looking first.
+    Blank has to be recognized, not inferred from failing to recognize
+    anything else: the payload must describe the device we asked about,
+    in the shape we captured, and show it empty. Anything we cannot
+    read, cannot understand, or that turns out to be about some other
+    disk is CARD_UNKNOWN and stops the run. Only a layout that
+    positively shows an empty card is safe to erase without looking.
 
     Args:
         disk: /dev/diskN path.
@@ -241,16 +267,38 @@ def _classify_card(disk: str) -> str:
         layout = plistlib.loads(result.stdout.encode())
     except Exception:
         return CARD_UNKNOWN
+    if not isinstance(layout, dict):
+        return CARD_UNKNOWN
     entries = layout.get("AllDisksAndPartitions")
-    if not entries:
+    if not isinstance(entries, list) or not entries:
         # diskutil succeeded but told us nothing about this disk.
         return CARD_UNKNOWN
+    if not all(isinstance(entry, dict) for entry in entries):
+        return CARD_UNKNOWN
+
+    # Any filesystem anywhere in the payload is enough to stop.
     for entry in entries:
+        parts = entry.get("Partitions") or []
+        volumes = entry.get("APFSVolumes") or []
+        if not isinstance(parts, list) or not isinstance(volumes, list):
+            return CARD_UNKNOWN
         if _entry_holds_a_filesystem(entry):
             return CARD_HAS_FILESYSTEM
-        for part in entry.get("Partitions", []) + entry.get("APFSVolumes", []):
-            if _entry_holds_a_filesystem(part):
+        for part in list(parts) + list(volumes):
+            if isinstance(part, dict) and _entry_holds_a_filesystem(part):
                 return CARD_HAS_FILESYSTEM
+
+    # Nothing found — but only the entry for the device we asked about
+    # can say the card is empty, and only in a shape we recognize.
+    wanted = _disk_identifier(disk)
+    described = [
+        entry for entry in entries
+        if entry.get("DeviceIdentifier") == wanted
+    ]
+    if len(described) != 1:
+        return CARD_UNKNOWN
+    if not _entry_is_recognizably_blank(described[0]):
+        return CARD_UNKNOWN
     return CARD_BLANK
 
 

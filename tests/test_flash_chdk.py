@@ -191,7 +191,7 @@ class TestCameraIdSurvivesAReflash:
 
         monkeypatch.setattr(tool, "get_mount_point", refuse)
         monkeypatch.setattr(tool, "_run", _fake_run(_blank_layout()))
-        assert tool.read_existing_own_txt("/dev/disk9") == (None, None)
+        assert tool.read_existing_own_txt("/dev/disk4") == (None, None)
         assert "blank" in capsys.readouterr().out
 
     def test_a_volume_that_will_not_mount_stops_the_run(
@@ -206,7 +206,7 @@ class TestCameraIdSurvivesAReflash:
         # diskutil says there is a filesystem, but it would not mount.
         monkeypatch.setattr(tool, "_run", _fake_run(PARTITIONED_LAYOUT))
         with pytest.raises(SystemExit):
-            tool.read_existing_own_txt("/dev/disk9")
+            tool.read_existing_own_txt("/dev/disk4")
         assert "could not be inspected" in capsys.readouterr().out
 
     def test_main_does_not_erase_a_volume_it_could_not_mount(
@@ -220,7 +220,7 @@ class TestCameraIdSurvivesAReflash:
 
         monkeypatch.setattr(tool, "download_chdk", lambda: None)
         monkeypatch.setattr(tool, "find_removable_disks", lambda: [])
-        monkeypatch.setattr(tool, "pick_disk", lambda disks: "/dev/disk9")
+        monkeypatch.setattr(tool, "pick_disk", lambda disks: "/dev/disk4")
         monkeypatch.setattr(tool, "get_mount_point", refuse)
         monkeypatch.setattr(tool, "_run", _fake_run(PARTITIONED_LAYOUT))
         monkeypatch.setattr(
@@ -285,13 +285,41 @@ class TestCameraIdSurvivesAReflash:
         monkeypatch.setattr(tool, "_run", _fake_run({"AllDisksAndPartitions": []}))
         assert tool._classify_card("/dev/disk4") == tool.CARD_UNKNOWN
 
+    def test_an_empty_entry_is_unknown_not_blank(self, monkeypatch):
+        tool = _load_tool()
+        # Nothing here says the device is empty; it says nothing at all.
+        monkeypatch.setattr(tool, "_run", _fake_run({
+            "AllDisksAndPartitions": [{}],
+        }))
+        assert tool._classify_card("/dev/disk4") == tool.CARD_UNKNOWN
+
+    def test_an_entry_of_unrecognized_fields_is_unknown(self, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(tool, "_run", _fake_run({
+            "AllDisksAndPartitions": [
+                {"SomeFutureKey": "whatever", "DeviceIdentifier": "disk4"},
+            ],
+        }))
+        assert tool._classify_card("/dev/disk4") == tool.CARD_UNKNOWN
+
+    def test_a_payload_about_another_device_is_unknown(self, monkeypatch):
+        tool = _load_tool()
+        # A blank layout, but not for the card we asked about.
+        monkeypatch.setattr(tool, "_run", _fake_run(_blank_layout()))
+        assert tool._classify_card("/dev/disk9") == tool.CARD_UNKNOWN
+
+    def test_a_bare_disk_identifier_is_accepted(self, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(tool, "_run", _fake_run(_blank_layout()))
+        assert tool._classify_card("disk4") == tool.CARD_BLANK
+
     def test_a_mounted_card_with_no_own_txt_has_no_id(
         self, tmp_path, monkeypatch,
     ):
         tool = _load_tool()
         monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
         monkeypatch.setattr(tool, "_run", _fake_run(PARTITIONED_LAYOUT))
-        assert tool.read_existing_own_txt("/dev/disk9") == (None, None)
+        assert tool.read_existing_own_txt("/dev/disk4") == (None, None)
 
     def test_an_unreadable_own_txt_stops_rather_than_reporting_no_id(
         self, tmp_path, monkeypatch,
@@ -301,7 +329,7 @@ class TestCameraIdSurvivesAReflash:
         (tmp_path / "OWN.TXT").mkdir()
         monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
         with pytest.raises(SystemExit):
-            tool.read_existing_own_txt("/dev/disk9")
+            tool.read_existing_own_txt("/dev/disk4")
 
     def test_main_does_not_erase_a_card_it_could_not_check(
         self, tmp_path, monkeypatch,
@@ -311,7 +339,7 @@ class TestCameraIdSurvivesAReflash:
         formatted = []
         monkeypatch.setattr(tool, "download_chdk", lambda: None)
         monkeypatch.setattr(tool, "find_removable_disks", lambda: [])
-        monkeypatch.setattr(tool, "pick_disk", lambda disks: "/dev/disk9")
+        monkeypatch.setattr(tool, "pick_disk", lambda disks: "/dev/disk4")
         monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
         monkeypatch.setattr(
             tool, "format_card", lambda disk: formatted.append(disk),
