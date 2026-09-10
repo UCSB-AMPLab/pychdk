@@ -69,6 +69,45 @@ def _fake_run(layout=None, returncode=0, stdout=None):
     return run
 
 
+def _scheme_only_layout(scheme):
+    """A card carrying a partition map and nothing else."""
+    return {
+        "AllDisksAndPartitions": [
+            {
+                "Content": scheme,
+                "DeviceIdentifier": "disk4",
+                "OSInternal": False,
+                "Partitions": [],
+                "Size": 15931539456,
+            },
+        ],
+        "WholeDisks": ["disk4"],
+    }
+
+
+def _fat32_layout():
+    """A card with the single FAT32 partition this tool creates."""
+    return {
+        "AllDisksAndPartitions": [
+            {
+                "Content": "FDisk_partition_scheme",
+                "DeviceIdentifier": "disk4",
+                "OSInternal": False,
+                "Partitions": [
+                    {
+                        "Content": "DOS_FAT_32",
+                        "DeviceIdentifier": "disk4s1",
+                        "VolumeName": "CHDK_A2500",
+                        "Size": 15931539456,
+                    },
+                ],
+                "Size": 15931539456,
+            },
+        ],
+        "WholeDisks": ["disk4"],
+    }
+
+
 def _two_volume_layout():
     """A card whose identity could live on a partition we never read."""
     return {
@@ -383,12 +422,22 @@ class TestCameraIdSurvivesAReflash:
 
     def test_an_apfs_container_counts_as_a_filesystem(self, monkeypatch):
         tool = _load_tool()
+        # Captured shape: an APFS volume has no Content of its own, so
+        # it has to be recognized by its name and mount point.
         layout = {
             "AllDisksAndPartitions": [
                 {
                     "Content": "Apple_APFS_Container",
                     "DeviceIdentifier": "disk4",
-                    "APFSVolumes": [{"DeviceIdentifier": "disk4s1"}],
+                    "Size": 15931539456,
+                    "APFSVolumes": [
+                        {
+                            "DeviceIdentifier": "disk4s1",
+                            "MountPoint": "/Volumes/Card",
+                            "VolumeName": "Card",
+                            "Size": 15931539456,
+                        },
+                    ],
                     "Partitions": [],
                 },
             ],
@@ -468,6 +517,64 @@ class TestCameraIdSurvivesAReflash:
         with pytest.raises(SystemExit):
             tool.main()
         assert formatted == []
+
+    def test_a_partition_map_with_no_partitions_is_blank(self, monkeypatch):
+        tool = _load_tool()
+        # A card that has been formatted and emptied still carries a
+        # scheme. That is the ordinary state of a card from a camera.
+        monkeypatch.setattr(tool, "_run", _fake_run(_scheme_only_layout(
+            "FDisk_partition_scheme",
+        )))
+        assert tool._classify_card("/dev/disk4") == tool.CARD_BLANK
+
+    def test_a_guid_scheme_with_no_partitions_is_blank(self, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(tool, "_run", _fake_run(_scheme_only_layout(
+            "GUID_partition_scheme",
+        )))
+        assert tool._classify_card("/dev/disk4") == tool.CARD_BLANK
+
+    def test_a_device_with_no_content_at_all_is_blank(self, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(tool, "_run", _fake_run(_blank_layout()))
+        assert tool._classify_card("/dev/disk4") == tool.CARD_BLANK
+
+    def test_one_fat32_partition_holds_a_filesystem(self, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(tool, "_run", _fake_run(_fat32_layout()))
+        assert tool._classify_card("/dev/disk4") == tool.CARD_HAS_FILESYSTEM
+
+    def test_a_freshly_formatted_card_can_still_be_flashed(
+        self, tmp_path, monkeypatch,
+    ):
+        tool = _load_tool()
+        monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
+        monkeypatch.setattr(tool, "_run", _fake_run(_fat32_layout()))
+        assert tool.read_existing_own_txt("/dev/disk4") == (None, None)
+
+    def test_an_empty_partitioned_card_is_not_refused(self, monkeypatch):
+        tool = _load_tool()
+        # The common case: a card out of a camera or a shop. Refusing
+        # this made the tool unusable on the first card anyone picked up.
+        monkeypatch.setattr(tool, "_run", _fake_run(_scheme_only_layout(
+            "FDisk_partition_scheme",
+        )))
+        assert tool.read_existing_own_txt("/dev/disk4") == (None, None)
+
+    def test_a_volume_we_cannot_characterize_is_unknown(self, monkeypatch):
+        tool = _load_tool()
+        # Something is under there, but nothing says what it is.
+        monkeypatch.setattr(tool, "_run", _fake_run({
+            "AllDisksAndPartitions": [
+                {
+                    "Content": "FDisk_partition_scheme",
+                    "DeviceIdentifier": "disk4",
+                    "Size": 15931539456,
+                    "Partitions": [{"DeviceIdentifier": "disk4s1"}],
+                },
+            ],
+        }))
+        assert tool._classify_card("/dev/disk4") == tool.CARD_UNKNOWN
 
     def test_a_mounted_card_with_no_own_txt_has_no_id(
         self, tmp_path, monkeypatch,

@@ -265,17 +265,46 @@ CARD_UNKNOWN = "unknown"
 # recognize, and an unrecognized shape is never called blank.
 _WHOLE_DISK_KEYS = frozenset({"Content", "DeviceIdentifier", "Size"})
 
+# What a whole-disk entry's Content says when it names a partition map
+# rather than a filesystem. A scheme says how the device is divided,
+# not that anything is on it, so a card carrying one and nothing else
+# is empty. Any other Content there names a filesystem written straight
+# to the device, which is something we would have to read and cannot.
+_PARTITION_SCHEMES = frozenset({
+    "GUID_partition_scheme",
+    "FDisk_partition_scheme",
+    "Apple_partition_scheme",
+})
+
 
 def _disk_identifier(disk: str) -> str:
     """Reduce /dev/diskN to the diskN that diskutil reports."""
     return disk.rsplit("/", 1)[-1]
 
 
-def _entry_holds_a_filesystem(entry: dict) -> bool:
-    """Whether one diskutil layout entry describes anything mountable."""
-    if entry.get("Content"):
+def _volume_holds_a_filesystem(volume: dict) -> bool:
+    """Whether one partition or volume entry describes a filesystem.
+
+    Judged from what the volume says about itself: a Content naming a
+    filesystem type, or a mount point, or a volume name. Real APFS
+    volumes carry no Content at all and identify themselves by name and
+    mount point, so all three have to count.
+
+    A whole-disk entry's Content is never consulted, because there it
+    names the partition scheme — GUID_partition_scheme and the like —
+    which says how the device is divided, not that anything is on it.
+    Reading a scheme as a filesystem refused every card that had ever
+    been formatted, which is every card an operator is likely to hold.
+    """
+    if volume.get("MountPoint") or volume.get("VolumeName"):
         return True
-    return bool(entry.get("Partitions") or entry.get("APFSVolumes"))
+    return bool(volume.get("Content"))
+
+
+def _whole_disk_content_is_only_a_scheme(entry: dict) -> bool:
+    """Whether a whole-disk entry's Content names nothing but a map."""
+    content = entry.get("Content")
+    return not content or content in _PARTITION_SCHEMES
 
 
 def _entry_is_recognizably_blank(entry: dict) -> bool:
@@ -283,11 +312,17 @@ def _entry_is_recognizably_blank(entry: dict) -> bool:
 
     Being unable to find a filesystem is not the same as finding none:
     an empty entry, or one made of keys we do not know, says nothing
-    about the card and must not be read as saying it is empty.
+    about the card and must not be read as saying it is empty. But a
+    partition map on its own is not something on the device — a card
+    that was formatted and then emptied still carries a scheme — so
+    blank means the shape is one we recognize and lists no partitions
+    and no volumes beneath it.
     """
     if not _WHOLE_DISK_KEYS.issubset(entry):
         return False
-    return not _entry_holds_a_filesystem(entry)
+    if not _whole_disk_content_is_only_a_scheme(entry):
+        return False
+    return not _volumes_of(entry)
 
 
 def _read_layout(disk: str) -> dict | None:
@@ -397,16 +432,21 @@ def _classify_layout(layout: dict, disk: str) -> str:
     if not all(isinstance(entry, dict) for entry in entries):
         return CARD_UNKNOWN
 
-    # Any filesystem anywhere in the payload is enough to stop.
+    # Any filesystem anywhere in the payload is enough to stop. Judged
+    # only from the nested volumes: the whole-disk Content is a scheme.
     for entry in entries:
+        if not _whole_disk_content_is_only_a_scheme(entry):
+            # A filesystem written straight to the device, with no
+            # partition to mount: something is there and we cannot read it.
+            return CARD_HAS_FILESYSTEM
         parts = entry.get("Partitions") or []
         volumes = entry.get("APFSVolumes") or []
         if not isinstance(parts, list) or not isinstance(volumes, list):
             return CARD_UNKNOWN
-        if _entry_holds_a_filesystem(entry):
-            return CARD_HAS_FILESYSTEM
-        for part in list(parts) + list(volumes):
-            if isinstance(part, dict) and _entry_holds_a_filesystem(part):
+        for volume in list(parts) + list(volumes):
+            if not isinstance(volume, dict):
+                return CARD_UNKNOWN
+            if _volume_holds_a_filesystem(volume):
                 return CARD_HAS_FILESYSTEM
 
     # Nothing found — but only the entry for the device we asked about
