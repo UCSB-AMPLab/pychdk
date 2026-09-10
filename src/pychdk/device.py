@@ -15,6 +15,7 @@ from pychdk.ptp import PTPSession, PTPError
 from pychdk.chdk import (
     ChdkPTP,
     MessageType,
+    _script_error_name,
     REMOTE_CAP_JPEG,
     REMOTE_CAP_NOTSET,
     REMOTE_CAP_RAW,
@@ -309,7 +310,10 @@ class ChdkDevice:
                 msg = self._chdk.read_script_message()
                 if msg.script_id == script_id:
                     if msg.msg_type == MessageType.ERR:
-                        raise RuntimeError(f"Capture script failed: {msg.value}")
+                        kind = _script_error_name(msg.data_type)
+                        raise RuntimeError(
+                            f"Capture script failed ({kind}): {msg.value}"
+                        )
                     # Only an explicit false is a refusal: an older CHDK
                     # returns nil, which must not be read as failure.
                     if msg.msg_type == MessageType.RET and msg.value is False:

@@ -87,9 +87,11 @@ pyusb / libusb    — raw USB access
 
 ## Camera side assignment
 
-For book scanning with two cameras, each body is assigned a page parity — which pages it shoots — stored in a file called `OWN.TXT` on the camera's SD card. The first line is `ODD` or `EVEN`; which of the two sits on the left is the operator's reading direction, and the file says nothing about it. A second line, `id=3f9a1c2b7d4e`, gives the body a stable identity, because pyusb cannot always read a serial number from a Canon compact. The Captua workflow reads the file via `download_file('A/OWN.TXT')` to determine page sequencing and EXIF orientation, and to tell one body from the other across replugs. Note the `A/` prefix: `download_file` and `upload_file` both take a card path.
+For book scanning with two cameras, each body is assigned a page parity — which pages it shoots — stored in a file called `OWN.TXT` on the camera's SD card. A parity line reads `ODD` or `EVEN`; which of the two sits on the left is the operator's reading direction, and the file says nothing about it. An id line, `id=3f9a1c2b7d4e`, gives the body a stable identity, because pyusb cannot always read a serial number from a Canon compact. The Captua workflow reads the file via `download_file('A/OWN.TXT')` to determine page sequencing and EXIF orientation, and to tell one body from the other across replugs. Note the `A/` prefix: `download_file` and `upload_file` both take a card path.
 
-The `tools/flash_chdk.py` script writes both lines during SD card preparation, keeping any id the card already carries. `parse_own_txt` and `format_own_txt` in `util.py` read and write the format.
+Either line can stand alone, so a reader must handle three shapes: both lines, an id with no parity, or no file at all. An id-only file is what an operator gets by skipping the parity prompt when flashing — the card keeps its identity even though nobody has said yet which pages it shoots. Treat a missing parity as unassigned rather than as an error.
+
+The `tools/flash_chdk.py` script writes whichever lines it has during SD card preparation, keeping any id the card already carries and writing nothing at all when there is neither a parity nor an id. `parse_own_txt` and `format_own_txt` in `util.py` read and write the format.
 
 ## Tools
 

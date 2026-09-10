@@ -183,6 +183,25 @@ class TestChdkDevice:
         with pytest.raises(RuntimeError, match="no such function"):
             dev.shoot(stream=True)
 
+    def test_streaming_names_the_error_kind(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 7
+        mock_chdk.remote_capture_is_ready.return_value = (False, 0)
+        mock_chdk.get_script_status.return_value = (True, True)
+        seen = {}
+        for kind in (ScriptErrorType.COMPILE, ScriptErrorType.RUN):
+            mock_chdk.read_script_message.return_value = ScriptMessage(
+                MessageType.ERR, kind, 7, "boom",
+            )
+            with pytest.raises(RuntimeError) as caught:
+                dev.shoot(stream=True)
+            seen[kind] = str(caught.value)
+        # Telling the kinds apart in read_script_message is worth
+        # nothing if the capture path flattens them again.
+        assert "compile" in seen[ScriptErrorType.COMPILE]
+        assert "run" in seen[ScriptErrorType.RUN]
+        assert seen[ScriptErrorType.COMPILE] != seen[ScriptErrorType.RUN]
+
     def test_streaming_ignores_a_message_from_another_script(self):
         dev, mock_chdk = self._make_device()
         mock_chdk.execute_script.return_value = 7
