@@ -175,9 +175,10 @@ class ChdkDevice:
         get_mode() to confirm the physical switch completed.
         """
         mode_val = 1 if mode == "record" else 0
-        self.lua_execute(f"switch_mode_usb({mode_val})", do_return=False)
-        # Wait for the script to finish before polling
-        self._chdk.wait_for_script(timeout=5)
+        script_id = self._chdk.execute_script(f"switch_mode_usb({mode_val})")
+        # Wait for the script to finish before polling, matching its id
+        # so an error left by an earlier shot is not blamed on this.
+        self._chdk.wait_for_script(timeout=5, script_id=script_id)
         # Give the camera time to physically switch (lens motor, etc.)
         time.sleep(1)
         for _ in range(8):

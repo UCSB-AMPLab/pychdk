@@ -82,6 +82,37 @@ class TestChdkDevice:
         result = dev.download_file("A/OWN.TXT")
         assert result == b"EVEN\n"
 
+    def test_switch_mode_waits_on_its_own_script_id(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 21
+        dev.switch_mode("record")
+        mock_chdk.wait_for_script.assert_called_once_with(
+            timeout=5, script_id=21,
+        )
+
+    def test_switch_mode_survives_a_previous_captures_error(self):
+        info = DeviceInfo(
+            vendor_id=0x04A9, product_id=0x1234,
+            bus_num=1, device_num=5, serial_num="ABC",
+        )
+        mock_usb = MagicMock()
+        mock_session = MagicMock()
+        with patch("pychdk.device.PTPDevice"), \
+             patch("pychdk.device.PTPSession", return_value=mock_session):
+            dev = ChdkDevice(info, _usb_device=mock_usb)
+        # The real waiter, against a queue holding an older shot's error.
+        mock_session.transaction.side_effect = [
+            ([21, 0], b""),          # switch_mode_usb starts, id 21
+            ([0b11], b""),           # running, message waiting
+            ([MessageType.ERR, ScriptErrorType.RUN, 9, 12],
+             b"stale error\x00"),    # from script 9, not ours
+            ([0], b""),              # ours finished cleanly
+            ([0, 0], b""),           # get_mode() script starts
+            ([0], b""),              # drain: nothing pending
+            ([0], b""),              # not running, no messages
+        ]
+        dev.switch_mode("record")
+
     def test_streamed_dng_is_refused(self):
         dev, mock_chdk = self._make_device()
         with pytest.raises(NotImplementedError, match="DNG"):
