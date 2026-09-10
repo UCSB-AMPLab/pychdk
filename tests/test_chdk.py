@@ -187,6 +187,24 @@ class TestScriptStartupStatus:
         assert session.transaction.call_count == 2
 
 
+class TestDrainMessages:
+    """Collecting leftovers must be bounded: a camera can keep talking."""
+
+    def _make_chdk(self):
+        mock_session = MagicMock()
+        return ChdkPTP(mock_session), mock_session
+
+    def test_a_queue_that_never_clears_still_ends(self):
+        chdk, session = self._make_chdk()
+        # Always "message waiting", never anything that ends it.
+        session.transaction.return_value = (
+            [MessageType.USER, ScriptDataType.STRING, 3, 1], b"x",
+        )
+        chdk.drain_messages()
+        # Bounded, so the call returns instead of reading forever.
+        assert session.transaction.call_count < 200
+
+
 class TestWaitForScript:
     """Waiting must notice a script that fails after it starts."""
 
@@ -204,6 +222,27 @@ class TestWaitForScript:
         ]
         with pytest.raises(RuntimeError, match="shoot failed"):
             chdk.wait_for_script(timeout=5)
+
+    def test_an_error_from_another_script_does_not_fail_this_one(self):
+        chdk, session = self._make_chdk()
+        session.transaction.side_effect = [
+            ([0b11], b""),  # running, message waiting
+            # Left over from the previous shot, not ours.
+            ([MessageType.ERR, ScriptErrorType.RUN, 3, 13],
+             b"stale error\x00"),
+            ([0], b""),     # ours finished cleanly
+        ]
+        assert chdk.wait_for_script(timeout=5, script_id=7) is None
+
+    def test_an_error_from_this_script_still_raises(self):
+        chdk, session = self._make_chdk()
+        session.transaction.side_effect = [
+            ([0b11], b""),
+            ([MessageType.ERR, ScriptErrorType.RUN, 7, 13],
+             b"our error\x00"),
+        ]
+        with pytest.raises(RuntimeError, match="our error"):
+            chdk.wait_for_script(timeout=5, script_id=7)
 
     def test_a_clean_completion_still_returns(self):
         chdk, session = self._make_chdk()

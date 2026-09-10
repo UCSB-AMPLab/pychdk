@@ -260,6 +260,14 @@ class TestChdkDevice:
         assert dev.shoot(stream=True) == b"jpeg"
         mock_chdk.remote_capture_get_data.assert_called_once_with(1)
 
+    def test_standard_shot_waits_on_its_own_script_id(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 11
+        dev.shoot()
+        mock_chdk.wait_for_script.assert_called_once_with(
+            timeout=30, script_id=11,
+        )
+
     def test_close(self):
         dev, mock_chdk = self._make_device()
         dev.close()

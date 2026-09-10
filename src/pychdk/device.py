@@ -339,9 +339,10 @@ class ChdkDevice:
     def _shoot_standard(self, setup_parts, download, remove):
         """Capture to SD card, optionally download and delete."""
         script = "; ".join(setup_parts + ["shoot()"])
-        self.lua_execute(script, do_return=False)
-        # Wait for the shoot script to finish (shutter + SD write)
-        self._chdk.wait_for_script(timeout=30)
+        script_id = self._chdk.execute_script(script)
+        # Wait for the shoot script to finish (shutter + SD write),
+        # matching its id so a previous shot's error is not ours.
+        self._chdk.wait_for_script(timeout=30, script_id=script_id)
 
         if not download:
             return None

@@ -427,7 +427,7 @@ class ChdkPTP:
             f"Remote capture did not end after {MAX_CAPTURE_CHUNKS} chunks"
         )
 
-    def wait_for_script(self, timeout=30.0):
+    def wait_for_script(self, timeout=30.0, script_id=None):
         """Wait until no script is running on the camera.
 
         Reads waiting messages as it goes, rather than watching only
@@ -438,6 +438,11 @@ class ChdkPTP:
 
         Args:
             timeout: Max seconds to wait for the script to finish.
+            script_id: Only raise on errors from this script. Starting
+                a script does not flush the queue, so an error left by
+                a previous one would otherwise fail this one. None
+                matches any script, which is only right when the caller
+                has no id to match.
 
         Raises:
             RuntimeError: If the script reported an error.
@@ -448,7 +453,8 @@ class ChdkPTP:
             running, has_msgs = self.get_script_status()
             if has_msgs:
                 msg = self.read_script_message()
-                if msg.msg_type == MessageType.ERR:
+                is_ours = script_id is None or msg.script_id == script_id
+                if is_ours and msg.msg_type == MessageType.ERR:
                     kind = _script_error_name(msg.data_type)
                     raise RuntimeError(f"Script error ({kind}): {msg.value}")
                 continue
