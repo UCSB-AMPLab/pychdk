@@ -180,19 +180,50 @@ def patch_boot_sector(disk: str):
 
 
 def get_mount_point(disk: str) -> str:
-    """Mount partition and return mount point."""
+    """Mount the partition and return where it actually is.
+
+    It used to fall back to /Volumes/<label> when the disk reported no
+    mount point, which is the worst possible answer: a path that looks
+    exactly like a real one, so callers reading a file there get a
+    plain "not found" from a directory that was never a card. The
+    identity check read that as a card carrying no id and let the card
+    be erased. A guessed path is worse than no path.
+
+    Args:
+        disk: /dev/diskN path.
+
+    Returns:
+        The directory the card is actually mounted at.
+
+    Raises:
+        SystemExit: If the partition reports no mount point, or reports
+            one that is not there.
+    """
     partition = disk + "s1"
     _run(["diskutil", "mount", partition])
     info_result = _run(["diskutil", "info", "-plist", partition])
     info = plistlib.loads(info_result.stdout.encode())
-    return info.get("MountPoint", f"/Volumes/{VOLUME_LABEL}")
+    mount_point = info.get("MountPoint")
+    if not mount_point:
+        print(f"{partition} reports no mount point; it is not mounted.")
+        sys.exit(1)
+    if not Path(mount_point).is_dir():
+        print(
+            f"{partition} reports mount point {mount_point}, "
+            "which is not a directory that exists."
+        )
+        sys.exit(1)
+    return mount_point
 
 
 def _mounted_path(disk: str) -> str | None:
     """Return where the card is mounted, or None if it will not mount.
 
-    get_mount_point exits the process when diskutil fails, which is
-    why SystemExit is caught here.
+    get_mount_point exits the process when diskutil fails or reports a
+    mount point that is not there, which is why SystemExit is caught
+    here. None means unknown, never "mounted and empty": the caller
+    decides what to do about it, and read_existing_own_txt stops unless
+    the card is positively blank.
     """
     try:
         return get_mount_point(disk)
@@ -431,6 +462,9 @@ def main():
     extract_chdk(zip_path, mount_point)
     patch_boot_sector(disk)
 
+    # Exits rather than guessing a path if the fresh card will not
+    # mount; better a rerun than OWN.TXT written somewhere that is not
+    # the card.
     mount_point = get_mount_point(disk)
     write_camera_side(mount_point, existing_side=existing_side,
                       existing_id=existing_id)

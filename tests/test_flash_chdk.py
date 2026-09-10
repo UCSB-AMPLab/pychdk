@@ -69,12 +69,57 @@ def _fake_run(layout=None, returncode=0, stdout=None):
     return run
 
 
+def _dispatching_run(info=None, layout=None):
+    """Stand in for _run, answering `info` and `list` separately."""
+
+    def run(cmd, **kwargs):
+        payload = layout if "list" in cmd else info
+        stdout = plistlib.dumps(payload).decode() if payload is not None else ""
+        return subprocess.CompletedProcess(cmd, 0, stdout, "")
+
+    return run
+
+
 def _load_tool():
     """Load tools/flash_chdk.py, which is a script and not a package."""
     spec = importlib.util.spec_from_file_location("flash_chdk", TOOL)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class TestGetMountPoint:
+    """A path we guessed is worse than no path: callers cannot tell."""
+
+    def test_a_report_with_no_mount_point_fails(self, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(
+            tool, "_run", _dispatching_run(info={"DeviceIdentifier": "disk4s1"}),
+        )
+        with pytest.raises(SystemExit):
+            tool.get_mount_point("/dev/disk4")
+
+    def test_an_empty_mount_point_fails(self, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(tool, "_run", _dispatching_run(info={"MountPoint": ""}))
+        with pytest.raises(SystemExit):
+            tool.get_mount_point("/dev/disk4")
+
+    def test_a_mount_point_that_is_not_there_fails(self, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(
+            tool, "_run",
+            _dispatching_run(info={"MountPoint": "/Volumes/NoSuchCard"}),
+        )
+        with pytest.raises(SystemExit):
+            tool.get_mount_point("/dev/disk4")
+
+    def test_a_real_mount_point_is_returned(self, tmp_path, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(
+            tool, "_run", _dispatching_run(info={"MountPoint": str(tmp_path)}),
+        )
+        assert tool.get_mount_point("/dev/disk4") == str(tmp_path)
 
 
 class TestCameraIdSurvivesAReflash:
@@ -312,6 +357,36 @@ class TestCameraIdSurvivesAReflash:
         tool = _load_tool()
         monkeypatch.setattr(tool, "_run", _fake_run(_blank_layout()))
         assert tool._classify_card("disk4") == tool.CARD_BLANK
+
+    def test_an_unmountable_card_with_a_filesystem_stops_the_run(
+        self, monkeypatch,
+    ):
+        tool = _load_tool()
+        # diskutil reports no mount point; the layout shows a filesystem.
+        # The old guessed path made this read as a clean absence.
+        monkeypatch.setattr(tool, "_run", _dispatching_run(
+            info={"DeviceIdentifier": "disk4s1"},
+            layout=PARTITIONED_LAYOUT,
+        ))
+        with pytest.raises(SystemExit):
+            tool.read_existing_own_txt("/dev/disk4")
+
+    def test_main_does_not_erase_a_card_it_could_not_mount(self, monkeypatch):
+        tool = _load_tool()
+        formatted = []
+        monkeypatch.setattr(tool, "download_chdk", lambda: None)
+        monkeypatch.setattr(tool, "find_removable_disks", lambda: [])
+        monkeypatch.setattr(tool, "pick_disk", lambda disks: "/dev/disk4")
+        monkeypatch.setattr(tool, "_run", _dispatching_run(
+            info={"DeviceIdentifier": "disk4s1"},
+            layout=PARTITIONED_LAYOUT,
+        ))
+        monkeypatch.setattr(
+            tool, "format_card", lambda disk: formatted.append(disk),
+        )
+        with pytest.raises(SystemExit):
+            tool.main()
+        assert formatted == []
 
     def test_a_mounted_card_with_no_own_txt_has_no_id(
         self, tmp_path, monkeypatch,
