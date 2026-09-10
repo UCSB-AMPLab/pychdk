@@ -118,6 +118,24 @@ class TestChdkDevice:
         with pytest.raises(NotImplementedError, match="DNG"):
             dev.shoot(dng=True, stream=True)
 
+    def test_the_dng_refusal_does_not_advise_the_card_path(self):
+        dev, mock_chdk = self._make_device()
+        with pytest.raises(NotImplementedError) as caught:
+            dev.shoot(dng=True, stream=True)
+        message = str(caught.value)
+        # _shoot_standard runs shoot() and never asks for a DNG, so
+        # sending the caller there would be advice that does nothing.
+        assert "stream=False" not in message
+        assert "card" in message.lower()
+
+    def test_the_card_path_does_not_request_a_dng(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 5
+        dev.shoot(dng=True)
+        script = mock_chdk.execute_script.call_args[0][0]
+        assert "dng" not in script.lower()
+        assert "raw" not in script.lower()
+
     def _ready_camera(self, mock_chdk, formats=0x01, data=b"jpeg"):
         mock_chdk.execute_script.return_value = 7
         mock_chdk.remote_capture_is_ready.return_value = (True, formats)

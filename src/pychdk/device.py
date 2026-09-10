@@ -213,7 +213,8 @@ class ChdkDevice:
         Args:
             shutter_speed: Shutter speed in seconds (e.g., 1/100).
             market_iso: ISO value (e.g., 100, 200).
-            dng: If True, capture in DNG raw format.
+            dng: Request DNG. Not implemented on either path: streaming
+                refuses it, and the card path ignores it.
             stream: If True, use remote capture (direct USB transfer).
             download_after: If True (and stream=False), download from SD card.
             remove_after: If True, delete from SD card after download.
@@ -261,14 +262,17 @@ class ChdkDevice:
             NotImplementedError: If dng is True. CHDK's DNG_HDR flag
                 sends the DNG header only; the raw data is a separate
                 transfer, and the client has to splice the two into a
-                file. This method downloads one format, so it cannot.
+                file. This method downloads one format, so it cannot,
+                and _shoot_standard does not request a DNG either.
         """
         if dng:
             raise NotImplementedError(
-                "Streamed DNG is not supported: CHDK sends the DNG header "
-                "and the raw data as two separate transfers that the client "
-                "must assemble into a file. Capture DNG with stream=False, "
-                "or stream JPEG."
+                "DNG capture is not implemented. Streaming would need the "
+                "DNG header and the raw data fetched as two separate "
+                "transfers and assembled into a file on this side, which "
+                "this library does not do; capturing to the card does not "
+                "request a DNG either, it runs shoot() and takes whatever "
+                "the camera is set to produce. Streamed JPEG works."
             )
 
         fmt = REMOTE_CAP_JPEG
