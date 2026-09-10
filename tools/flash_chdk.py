@@ -7,11 +7,16 @@ writes OWN.TXT for camera side assignment (ODD/EVEN).
 """
 
 import plistlib
+import secrets
 import subprocess
 import sys
 import urllib.request
 import zipfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from pychdk.util import format_own_txt, parse_own_txt
 
 CHDK_URL = "https://www.mighty-hoernsche.de/bins/a2500-100a-1.6.1-6315-full.zip"
 CHDK_FILENAME = "a2500-100a-1.6.1-6315-full.zip"
@@ -110,10 +115,17 @@ def format_card(disk: str) -> str:
         "FAT32", VOLUME_LABEL,
         "MBRFormat", disk,
     ])
-    partition = disk + "s1"
-    info_result = _run(["diskutil", "info", "-plist", partition])
-    info = plistlib.loads(info_result.stdout.encode())
-    mount_point = info.get("MountPoint", f"/Volumes/{VOLUME_LABEL}")
+    # eraseDisk leaves the new volume mounted, so do not mount again —
+    # but insist that it really is mounted rather than guessing a path.
+    mount_point = get_mount_point(
+        disk,
+        mount=False,
+        context=(
+            f"{disk} was formatted and then did not come back as a "
+            "mounted volume. Nothing has been written to the card. "
+            "Reinsert it and run this again."
+        ),
+    )
     print(f"Formatted. Mounted at {mount_point}")
     return mount_point
 
@@ -174,32 +186,406 @@ def patch_boot_sector(disk: str):
     print("Boot sector patched.")
 
 
-def get_mount_point(disk: str) -> str:
-    """Mount partition and return mount point."""
+def _no_mount_point(reason: str, context: str):
+    """Report that there is no usable mount point, and stop."""
+    print(reason)
+    if context:
+        print(context)
+    sys.exit(1)
+
+
+def get_mount_point(disk: str, mount: bool = True, context: str = "") -> str:
+    """Return where the card's first partition is actually mounted.
+
+    This is the only place that decides what counts as a mount point,
+    and the only place that fails when there is not one. Both callers
+    used to fall back to /Volumes/<label> when the disk reported none,
+    which is the worst possible answer: a path that looks exactly like
+    a real one. Reading a file under it gives a plain "not found" from
+    a directory that was never a card, and writing under it succeeds
+    against the Mac's own filesystem.
+
+    Args:
+        disk: /dev/diskN path.
+        mount: Whether to mount first. False for a caller that has just
+            done something leaving the volume mounted, such as
+            eraseDisk, so the question is only ever asked one way.
+        context: Line printed after the reason when there is no usable
+            mount point, saying what the caller was in the middle of.
+
+    Returns:
+        The directory the card is actually mounted at.
+
+    Raises:
+        SystemExit: If the partition reports no mount point, or reports
+            one that is not there.
+    """
     partition = disk + "s1"
-    _run(["diskutil", "mount", partition])
+    if mount:
+        _run(["diskutil", "mount", partition])
     info_result = _run(["diskutil", "info", "-plist", partition])
     info = plistlib.loads(info_result.stdout.encode())
-    return info.get("MountPoint", f"/Volumes/{VOLUME_LABEL}")
+    mount_point = info.get("MountPoint")
+    if not mount_point:
+        _no_mount_point(
+            f"{partition} reports no mount point; it is not mounted.",
+            context,
+        )
+    if not Path(mount_point).is_dir():
+        _no_mount_point(
+            f"{partition} reports mount point {mount_point}, "
+            "which is not a directory that exists.",
+            context,
+        )
+    return mount_point
 
 
-def write_camera_side(mount_point: str):
-    """Ask user for camera side and write OWN.TXT."""
-    choice = input("Which side is this camera? [o]dd / [e]ven / [s]kip: ").strip().lower()
+def _mounted_path(disk: str) -> str | None:
+    """Return where the card is mounted, or None if it will not mount.
+
+    get_mount_point exits the process when diskutil fails or reports a
+    mount point that is not there, which is why SystemExit is caught
+    here. None means unknown, never "mounted and empty": the caller
+    decides what to do about it, and read_existing_own_txt stops unless
+    the card is positively blank.
+    """
+    try:
+        return get_mount_point(disk)
+    except (SystemExit, ValueError):
+        return None
+
+
+CARD_BLANK = "blank"
+CARD_HAS_FILESYSTEM = "filesystem"
+CARD_UNKNOWN = "unknown"
+
+
+# The keys every whole-disk entry of `diskutil list -plist` carries,
+# captured from real output. An entry without them is not a shape we
+# recognize, and an unrecognized shape is never called blank.
+_WHOLE_DISK_KEYS = frozenset({"Content", "DeviceIdentifier", "Size"})
+
+# What a whole-disk entry's Content says when it names a partition map
+# rather than a filesystem. A scheme says how the device is divided,
+# not that anything is on it, so a card carrying one and nothing else
+# is empty. Any other Content there names a filesystem written straight
+# to the device, which is something we would have to read and cannot.
+_PARTITION_SCHEMES = frozenset({
+    "GUID_partition_scheme",
+    "FDisk_partition_scheme",
+    "Apple_partition_scheme",
+})
+
+
+def _disk_identifier(disk: str) -> str:
+    """Reduce /dev/diskN to the diskN that diskutil reports."""
+    return disk.rsplit("/", 1)[-1]
+
+
+def _volume_holds_a_filesystem(volume: dict) -> bool:
+    """Whether one partition or volume entry describes a filesystem.
+
+    Judged from what the volume says about itself: a Content naming a
+    filesystem type, or a mount point, or a volume name. Real APFS
+    volumes carry no Content at all and identify themselves by name and
+    mount point, so all three have to count.
+
+    A whole-disk entry's Content is never consulted, because there it
+    names the partition scheme — GUID_partition_scheme and the like —
+    which says how the device is divided, not that anything is on it.
+    Reading a scheme as a filesystem refused every card that had ever
+    been formatted, which is every card an operator is likely to hold.
+    """
+    if volume.get("MountPoint") or volume.get("VolumeName"):
+        return True
+    return bool(volume.get("Content"))
+
+
+def _whole_disk_content_is_only_a_scheme(entry: dict) -> bool:
+    """Whether a whole-disk entry's Content names nothing but a map."""
+    content = entry.get("Content")
+    return not content or content in _PARTITION_SCHEMES
+
+
+def _entry_is_recognizably_blank(entry: dict) -> bool:
+    """Whether an entry positively shows a device with nothing on it.
+
+    Being unable to find a filesystem is not the same as finding none:
+    an empty entry, or one made of keys we do not know, says nothing
+    about the card and must not be read as saying it is empty. But a
+    partition map on its own is not something on the device — a card
+    that was formatted and then emptied still carries a scheme — so
+    blank means the shape is one we recognize and lists no partitions
+    and no volumes beneath it.
+    """
+    if not _WHOLE_DISK_KEYS.issubset(entry):
+        return False
+    if not _whole_disk_content_is_only_a_scheme(entry):
+        return False
+    return not _volumes_of(entry)
+
+
+def _read_layout(disk: str) -> dict | None:
+    """Return diskutil's layout for the whole device, or None."""
+    result = _run(["diskutil", "list", "-plist", disk], check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        layout = plistlib.loads(result.stdout.encode())
+    except Exception:
+        return None
+    if not isinstance(layout, dict):
+        return None
+    return layout
+
+
+def _volumes_of(entry: dict) -> list:
+    """Every volume a whole-disk entry lists, however it lists them."""
+    parts = entry.get("Partitions") or []
+    volumes = entry.get("APFSVolumes") or []
+    if not isinstance(parts, list) or not isinstance(volumes, list):
+        return []
+    return list(parts) + list(volumes)
+
+
+def _layout_is_inspectable(layout: dict, disk: str) -> bool:
+    """Whether the card's layout is the one shape this tool can read.
+
+    The tool reads OWN.TXT from the first partition and nowhere else,
+    so the only card it can honestly say it has inspected is one whose
+    first partition is its only volume. A second volume, or a
+    filesystem sitting on the whole device, could hold a camera id we
+    would never look at — and a first partition that mounts and has no
+    OWN.TXT is then not evidence of anything.
+
+    Args:
+        layout: Parsed `diskutil list -plist` output.
+        disk: /dev/diskN path.
+
+    Returns:
+        True only for a single volume named <diskN>s1.
+    """
+    wanted = _disk_identifier(disk)
+    entries = layout.get("AllDisksAndPartitions")
+    if not isinstance(entries, list):
+        return False
+    described = [
+        entry for entry in entries
+        if isinstance(entry, dict) and entry.get("DeviceIdentifier") == wanted
+    ]
+    if len(described) != 1:
+        return False
+    volumes = _volumes_of(described[0])
+    if len(volumes) != 1 or not isinstance(volumes[0], dict):
+        return False
+    return volumes[0].get("DeviceIdentifier") == f"{wanted}s1"
+
+
+def _stop_uninspectable(reason: str):
+    """Refuse to erase a card we cannot honestly say we have read."""
+    print(reason)
+    print(
+        "Stopping before the card is erased: erasing it could destroy a "
+        "camera's identity. If you know this card is safe to erase, "
+        "erase it yourself and run this again."
+    )
+    sys.exit(1)
+
+
+def _classify_card(disk: str) -> str:
+    """Ask diskutil what the whole card holds. See _classify_layout."""
+    layout = _read_layout(disk)
+    if layout is None:
+        return CARD_UNKNOWN
+    return _classify_layout(layout, disk)
+
+
+def _classify_layout(layout: dict, disk: str) -> str:
+    """Decide what a card holds from its parsed diskutil layout.
+
+    Inspecting one partition cannot answer this: an existing but
+    unformatted diskNs1 reports fine and then will not mount, and a
+    diskNs1 that is missing does not prove the card is empty, since the
+    filesystem may be on the whole device or on another partition. So
+    read the layout of the whole device and judge from every entry in
+    it. `diskutil list -plist` returns AllDisksAndPartitions, whose
+    entries carry a Content naming the partition scheme or filesystem
+    and, when there is one, a Partitions or APFSVolumes list.
+
+    Blank has to be recognized, not inferred from failing to recognize
+    anything else: the payload must describe the device we asked about,
+    in the shape we captured, and show it empty. Anything we cannot
+    read, cannot understand, or that turns out to be about some other
+    disk is CARD_UNKNOWN and stops the run. Only a layout that
+    positively shows an empty card is safe to erase without looking.
+
+    Args:
+        disk: /dev/diskN path.
+
+    Returns:
+        CARD_BLANK, CARD_HAS_FILESYSTEM or CARD_UNKNOWN.
+    """
+    entries = layout.get("AllDisksAndPartitions")
+    if not isinstance(entries, list) or not entries:
+        # diskutil succeeded but told us nothing about this disk.
+        return CARD_UNKNOWN
+    if not all(isinstance(entry, dict) for entry in entries):
+        return CARD_UNKNOWN
+
+    # Any filesystem anywhere in the payload is enough to stop. Judged
+    # only from the nested volumes: the whole-disk Content is a scheme.
+    for entry in entries:
+        if not _whole_disk_content_is_only_a_scheme(entry):
+            # A filesystem written straight to the device, with no
+            # partition to mount: something is there and we cannot read it.
+            return CARD_HAS_FILESYSTEM
+        parts = entry.get("Partitions") or []
+        volumes = entry.get("APFSVolumes") or []
+        if not isinstance(parts, list) or not isinstance(volumes, list):
+            return CARD_UNKNOWN
+        for volume in list(parts) + list(volumes):
+            if not isinstance(volume, dict):
+                return CARD_UNKNOWN
+            if _volume_holds_a_filesystem(volume):
+                return CARD_HAS_FILESYSTEM
+
+    # Nothing found — but only the entry for the device we asked about
+    # can say the card is empty, and only in a shape we recognize.
+    wanted = _disk_identifier(disk)
+    described = [
+        entry for entry in entries
+        if entry.get("DeviceIdentifier") == wanted
+    ]
+    if len(described) != 1:
+        return CARD_UNKNOWN
+    if not _entry_is_recognizably_blank(described[0]):
+        return CARD_UNKNOWN
+    return CARD_BLANK
+
+
+def read_existing_own_txt(disk: str) -> tuple[str | None, str | None]:
+    """Read a card's parity and camera id before the card is erased.
+
+    main() formats the card long before OWN.TXT could be read off it,
+    so the id has to be salvaged first or it is gone. That makes the
+    difference between "this card has no id" and "this card's id could
+    not be read" worth keeping: the first is an ordinary blank card,
+    the second means erasing would destroy an identity we cannot see.
+    A card that reports no filesystem at all is genuinely blank, and
+    formatting one is what this tool is for. A card that reports a
+    volume we then could not mount or read is not blank — it is
+    unexamined, and erasing it would be a guess.
+
+    Args:
+        disk: /dev/diskN path.
+
+    Both fields are salvaged, not just the id: an operator who skips
+    the parity prompt means "leave the assignment alone", which is only
+    possible if we still know what the assignment was.
+
+    Returns:
+        Tuple of (side, camera_id), each None if the card genuinely
+        carries none.
+
+    Raises:
+        SystemExit: If the card holds a filesystem that could not be
+            inspected, so that no caller can go on to format it.
+    """
+    layout = _read_layout(disk)
+    if layout is None:
+        _stop_uninspectable("The card's layout could not be read.")
+
+    classification = _classify_layout(layout, disk)
+    if classification == CARD_BLANK:
+        # Nothing on the card, so nothing to lose by erasing it.
+        print("Card holds no filesystem; treating it as blank.")
+        return None, None
+    if classification != CARD_HAS_FILESYSTEM:
+        _stop_uninspectable(
+            "The card's layout is not one this tool recognizes."
+        )
+    if not _layout_is_inspectable(layout, disk):
+        _stop_uninspectable(
+            "The card holds a layout this tool cannot inspect: it reads "
+            "OWN.TXT from the first partition only, and this card keeps "
+            "a filesystem somewhere else as well."
+        )
+
+    mount_point = _mounted_path(disk)
+    if mount_point is None:
+        _stop_uninspectable(
+            "The card holds a filesystem that could not be mounted."
+        )
+
+    own_txt = Path(mount_point) / "OWN.TXT"
+    try:
+        data = own_txt.read_bytes()
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        print(f"Could not read {own_txt}: {exc}")
+        print(
+            "Stopping before the card is erased. This card may carry a "
+            "camera id, and formatting it would lose that body's "
+            "identity. Repair the card, or delete OWN.TXT deliberately, "
+            "then run this again."
+        )
+        sys.exit(1)
+    return parse_own_txt(data)
+
+
+def write_camera_side(mount_point: str, existing_side: str | None = None,
+                      existing_id: str | None = None):
+    """Ask which pages this camera shoots and write OWN.TXT.
+
+    The file carries the page parity and a stable id for the body. An
+    id already on the card is kept, so re-flashing a card does not
+    change which camera the toolkit thinks it is — including when the
+    operator declines to set a parity, since the card has already been
+    erased by then and skipping would otherwise throw the rescued id
+    away. A card with neither parity nor id has nothing worth writing.
+
+    Args:
+        mount_point: Where the card is mounted.
+        existing_side: Parity read off the card before it was erased.
+            Skipping the prompt keeps it, so a card that said EVEN
+            still says EVEN.
+        existing_id: Id read off the card before it was erased, if any.
+            Both fall back to reading OWN.TXT here, for a card that was
+            not formatted in this run.
+    """
+    choice = input("Which pages does this camera shoot? [o]dd / [e]ven / [s]kip: ").strip().lower()
     if choice in ("o", "odd"):
         side = "ODD"
     elif choice in ("e", "even"):
         side = "EVEN"
     elif choice in ("s", "skip", ""):
         print("Skipping camera side assignment.")
-        return
+        side = existing_side
     else:
         print(f"Unknown choice '{choice}', skipping.")
-        return
+        side = existing_side
 
     own_txt = Path(mount_point) / "OWN.TXT"
-    own_txt.write_text(side + "\n")
-    print(f"Wrote OWN.TXT ({side})")
+    camera_id = existing_id
+    if side is None or camera_id is None:
+        try:
+            on_card_side, on_card_id = parse_own_txt(own_txt.read_bytes())
+        except OSError:
+            on_card_side, on_card_id = None, None
+        side = side or on_card_side
+        camera_id = camera_id or on_card_id
+    if camera_id:
+        origin = "kept the id already on the card"
+    elif side:
+        camera_id = secrets.token_hex(6)
+        origin = "minted a new id"
+    else:
+        # No parity to record and no identity to preserve.
+        return
+
+    own_txt.write_text(format_own_txt(side, camera_id))
+    print(f"Wrote OWN.TXT ({side or 'no parity'}, id={camera_id}) — {origin}")
 
 
 def eject_card(disk: str):
@@ -212,12 +598,18 @@ def main():
     zip_path = download_chdk()
     disks = find_removable_disks()
     disk = pick_disk(disks)
+    # Salvage the body's identity before eraseDisk takes it away.
+    existing_side, existing_id = read_existing_own_txt(disk)
     mount_point = format_card(disk)
     extract_chdk(zip_path, mount_point)
     patch_boot_sector(disk)
 
+    # Exits rather than guessing a path if the fresh card will not
+    # mount; better a rerun than OWN.TXT written somewhere that is not
+    # the card.
     mount_point = get_mount_point(disk)
-    write_camera_side(mount_point)
+    write_camera_side(mount_point, existing_side=existing_side,
+                      existing_id=existing_id)
     eject_card(disk)
     print("Done! Lock the SD card and insert into camera.")
 

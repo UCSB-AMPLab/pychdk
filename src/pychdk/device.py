@@ -5,6 +5,7 @@ camera — and list_devices() for discovery.
 """
 import atexit
 import signal
+import threading
 import time
 import weakref
 from collections import namedtuple
@@ -14,11 +15,20 @@ from pychdk.ptp import PTPSession, PTPError
 from pychdk.chdk import (
     ChdkPTP,
     MessageType,
+    _script_error_name,
     REMOTE_CAP_JPEG,
+    REMOTE_CAP_NOTSET,
     REMOTE_CAP_RAW,
     REMOTE_CAP_DNG_HDR,
 )
 from pychdk.util import shutter_to_tv96, iso_to_sv96
+
+
+# How long a capture script is allowed to still be starting before an
+# "uninitialized" answer counts against it. CHDK acknowledges a script
+# as scheduled, not as run, so the first polls can legitimately land
+# before init_usb_capture has executed.
+CAPTURE_INIT_GRACE = 5.0
 
 
 DeviceInfo = namedtuple("DeviceInfo", [
@@ -90,11 +100,44 @@ def _signal_handler(signum, frame):
         signal.raise_signal(signum)
 
 
+def install_signal_handlers():
+    """Install the SIGINT/SIGTERM handlers that close open cameras.
+
+    Python only allows handlers to be installed from the main thread of
+    the main interpreter, so this declines anywhere else instead of
+    raising: a host that first imports pychdk inside a worker thread —
+    a synchronous FastAPI route, say — would otherwise fail on the
+    import. Such a host can call this later from its main thread to get
+    the handlers after all. Installing twice is harmless; the originals
+    are captured once.
+
+    Returns:
+        True if our handlers are in place, False if it declined.
+    """
+    global _original_sigint, _original_sigterm
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    current_sigint = signal.getsignal(signal.SIGINT)
+    current_sigterm = signal.getsignal(signal.SIGTERM)
+    if current_sigint is _signal_handler and current_sigterm is _signal_handler:
+        return True
+    # Never save our own handler as the original: that would recurse.
+    if current_sigint is not _signal_handler:
+        _original_sigint = current_sigint
+    if current_sigterm is not _signal_handler:
+        _original_sigterm = current_sigterm
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+    except ValueError:
+        # Some embeddings refuse even on the main thread.
+        return False
+    return True
+
+
+# atexit is thread-safe, so it is registered unconditionally.
 atexit.register(_cleanup_all)
-_original_sigint = signal.getsignal(signal.SIGINT)
-_original_sigterm = signal.getsignal(signal.SIGTERM)
-signal.signal(signal.SIGINT, _signal_handler)
-signal.signal(signal.SIGTERM, _signal_handler)
+install_signal_handlers()
 
 
 class ChdkDevice:
@@ -133,9 +176,10 @@ class ChdkDevice:
         get_mode() to confirm the physical switch completed.
         """
         mode_val = 1 if mode == "record" else 0
-        self.lua_execute(f"switch_mode_usb({mode_val})", do_return=False)
-        # Wait for the script to finish before polling
-        self._chdk.wait_for_script(timeout=5)
+        script_id = self._chdk.execute_script(f"switch_mode_usb({mode_val})")
+        # Wait for the script to finish before polling, matching its id
+        # so an error left by an earlier shot is not blamed on this.
+        self._chdk.wait_for_script(timeout=5, script_id=script_id)
         # Give the camera time to physically switch (lens motor, etc.)
         time.sleep(1)
         for _ in range(8):
@@ -170,7 +214,8 @@ class ChdkDevice:
         Args:
             shutter_speed: Shutter speed in seconds (e.g., 1/100).
             market_iso: ISO value (e.g., 100, 200).
-            dng: If True, capture in DNG raw format.
+            dng: Request DNG. Not implemented on either path: streaming
+                refuses it, and the card path ignores it.
             stream: If True, use remote capture (direct USB transfer).
             download_after: If True (and stream=False), download from SD card.
             remove_after: If True, delete from SD card after download.
@@ -192,32 +237,133 @@ class ChdkDevice:
             return self._shoot_standard(parts, download_after, remove_after)
 
     def _shoot_streaming(self, setup_parts, dng):
-        """Capture using remote capture (PTP commands 13/14)."""
-        fmt = REMOTE_CAP_JPEG
+        """Capture using remote capture (PTP commands 13/14).
+
+        Setup and shutter go out as one script, because a second script
+        kills the first unless NOKILL is set ("if script is running
+        return error instead of killing", core/ptp.h) — so a separate
+        shoot() could terminate the init_usb_capture that was still
+        running and leave the camera taking an ordinary card shot while
+        we waited for bytes that were never coming.
+
+        The script is started, not waited on, and that order matters:
+        CHDK can hold the capture pipeline until the host takes the
+        data, so waiting for the script to return before downloading
+        leaves both sides waiting on each other and the capture times
+        out having never once asked whether data was ready. We service
+        the camera while the script runs — readiness first, messages
+        second. Once the picture is in hand the queue is cleared of
+        whatever the script left, which is housekeeping so the next
+        capture does not read a stale message: it is a bounded sweep of
+        what is already waiting, not a wait for a result still to come.
+
+        Raises:
+            RuntimeError: If the camera refuses to initialize remote
+                capture.
+            NotImplementedError: If dng is True. CHDK's DNG_HDR flag
+                sends the DNG header only; the raw data is a separate
+                transfer, and the client has to splice the two into a
+                file. This method downloads one format, so it cannot,
+                and _shoot_standard does not request a DNG either.
+        """
         if dng:
-            fmt = REMOTE_CAP_RAW | REMOTE_CAP_DNG_HDR
+            raise NotImplementedError(
+                "DNG capture is not implemented. Streaming would need the "
+                "DNG header and the raw data fetched as two separate "
+                "transfers and assembled into a file on this side, which "
+                "this library does not do; capturing to the card does not "
+                "request a DNG either, it runs shoot() and takes whatever "
+                "the camera is set to produce. Streamed JPEG works."
+            )
 
-        script = "init_usb_capture({})".format(fmt)
-        for part in setup_parts:
-            script = part + "; " + script
-        self.lua_execute(script, do_return=False)
+        fmt = REMOTE_CAP_JPEG
+        setup = "".join(part + "; " for part in setup_parts)
+        script = (
+            f"{setup}local ok = init_usb_capture({fmt}); "
+            "if ok == false then return false end; "
+            "shoot(); "
+            "return true"
+        )
+        script_id = self._chdk.execute_script(script)
 
-        self.lua_execute("shoot()", do_return=False)
-
+        image = None
         deadline = time.monotonic() + 30
+        grace = CAPTURE_INIT_GRACE
+        init_deadline = time.monotonic() + grace
         while time.monotonic() < deadline:
-            ready, img_fmt = self._chdk.remote_capture_is_ready()
+            ready, status = self._chdk.remote_capture_is_ready()
+            formats = status
             if ready:
-                return self._chdk.remote_capture_get_data(img_fmt)
+                # A mask without the format we asked for is a fault, not
+                # a menu: the other bits are a different picture.
+                if not formats & fmt:
+                    raise RuntimeError(
+                        f"The camera has no 0x{fmt:02x} data ready; "
+                        f"it offers 0x{formats:02x}"
+                    )
+                # The request parameter is one bit, not the whole mask.
+                image = self._chdk.remote_capture_get_data(fmt)
+                break
+
+            running, has_msgs = self._chdk.get_script_status()
+            if has_msgs:
+                msg = self._chdk.read_script_message()
+                if msg.script_id == script_id:
+                    if msg.msg_type == MessageType.ERR:
+                        kind = _script_error_name(msg.data_type)
+                        raise RuntimeError(
+                            f"Capture script failed ({kind}): {msg.value}"
+                        )
+                    # Only an explicit false is a refusal: an older CHDK
+                    # returns nil, which must not be read as failure.
+                    if msg.msg_type == MessageType.RET and msg.value is False:
+                        raise RuntimeError(
+                            "The camera refused to initialize remote "
+                            "capture: init_usb_capture returned false"
+                        )
+                continue
+
+            # Checked after the queue, so a script that explained itself
+            # is reported by its own words rather than by this status.
+            # The two ways of getting here are different observations
+            # and read differently in a bench log: a script that ran and
+            # did not initialize, versus one still going after we gave
+            # up waiting. Neither proves the camera cannot do this.
+            if status == REMOTE_CAP_NOTSET:
+                if not running:
+                    raise RuntimeError(
+                        "The capture script ended without initializing "
+                        "remote capture"
+                    )
+                if time.monotonic() >= init_deadline:
+                    raise RuntimeError(
+                        "The capture script did not initialize remote "
+                        f"capture within {grace}s and is still running"
+                    )
+            if not running:
+                raise RuntimeError(
+                    "The capture script finished without producing a capture"
+                )
             time.sleep(0.1)
-        raise TimeoutError("Remote capture did not complete")
+
+        if image is None:
+            raise TimeoutError("Remote capture did not complete")
+
+        # Clear what the script left behind so the next capture does not
+        # read a stale message — but never at the cost of this picture.
+        try:
+            self._chdk.drain_messages()
+        except Exception:
+            pass
+        return image
 
     def _shoot_standard(self, setup_parts, download, remove):
         """Capture to SD card, optionally download and delete."""
         script = "; ".join(setup_parts + ["shoot()"])
-        self.lua_execute(script, do_return=False)
-        # Wait for the shoot script to finish (shutter + SD write)
-        self._chdk.wait_for_script(timeout=30)
+        script_id = self._chdk.execute_script(script)
+        # Wait for the shoot script to finish (shutter + SD write),
+        # matching its id so a previous shot's error is not ours.
+        self._chdk.wait_for_script(timeout=30, script_id=script_id)
 
         if not download:
             return None

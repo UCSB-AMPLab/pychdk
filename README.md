@@ -87,9 +87,11 @@ pyusb / libusb    — raw USB access
 
 ## Camera side assignment
 
-For book scanning with two cameras, each camera is identified as "odd" or "even" (left/right pages). This is stored in a file called `OWN.TXT` on the camera's SD card containing either `ODD` or `EVEN`. The Captua workflow reads this via `download_file('OWN.TXT')` to determine page sequencing and EXIF orientation.
+For book scanning with two cameras, each body is assigned a page parity — which pages it shoots — stored in a file called `OWN.TXT` on the camera's SD card. A parity line reads `ODD` or `EVEN`; which of the two sits on the left is the operator's reading direction, and the file says nothing about it. An id line, `id=3f9a1c2b7d4e`, gives the body a stable identity, because pyusb cannot always read a serial number from a Canon compact. The Captua workflow reads the file via `download_file('A/OWN.TXT')` to determine page sequencing and EXIF orientation, and to tell one body from the other across replugs. Note the `A/` prefix: `download_file` and `upload_file` both take a card path.
 
-The `tools/flash_chdk.py` script writes this file during SD card preparation.
+Either line can stand alone, so a reader must handle four shapes: both lines, a parity alone, an identity alone, and no file at all. `parse_own_txt` and `format_own_txt` in `util.py` read and write all four; treat a missing parity as unassigned rather than as an error.
+
+Skipping the parity prompt while flashing means "leave the assignment alone", so a card that said `EVEN` still says `EVEN` afterwards. An identity-only file is what skipping produces on a card that had no parity to preserve — the body keeps its identity even though nobody has said yet which pages it shoots — and a card with neither a parity nor an identity gets no file at all. In practice `tools/flash_chdk.py` never writes a parity on its own, because it mints an identity whenever it writes one; a parity-only file comes from an older card or a hand-written one, and is read normally.
 
 ## Tools
 
