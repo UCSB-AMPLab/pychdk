@@ -205,16 +205,49 @@ class TestChdkDevice:
         mock_chdk.remote_capture_get_data.return_value = b"jpeg"
         assert dev.shoot(stream=True) == b"jpeg"
 
-    def test_not_initialized_after_the_script_ended_is_a_failure(self):
+    def test_a_script_that_ended_without_initializing_says_so(self):
         dev, mock_chdk = self._make_device()
         mock_chdk.execute_script.return_value = 7
         mock_chdk.remote_capture_is_ready.return_value = (
             False, REMOTE_CAP_NOTSET,
         )
         mock_chdk.get_script_status.return_value = (False, False)
-        with pytest.raises(RuntimeError, match="never initialized"):
+        with pytest.raises(RuntimeError, match="ended without initializing"):
             dev.shoot(stream=True)
         assert mock_chdk.remote_capture_is_ready.call_count == 1
+
+    def test_an_expired_grace_says_how_long_it_waited(self, monkeypatch):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 7
+        mock_chdk.remote_capture_is_ready.return_value = (
+            False, REMOTE_CAP_NOTSET,
+        )
+        # Still running: the camera may merely be slow, which is a
+        # different observation from a script that finished.
+        mock_chdk.get_script_status.return_value = (True, False)
+        monkeypatch.setattr("pychdk.device.CAPTURE_INIT_GRACE", 0.0)
+        with pytest.raises(RuntimeError, match=r"within 0.0s"):
+            dev.shoot(stream=True)
+
+    def test_neither_initialization_message_claims_incompatibility(
+        self, monkeypatch,
+    ):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.execute_script.return_value = 7
+        mock_chdk.remote_capture_is_ready.return_value = (
+            False, REMOTE_CAP_NOTSET,
+        )
+        monkeypatch.setattr("pychdk.device.CAPTURE_INIT_GRACE", 0.0)
+        seen = []
+        for running in (True, False):
+            mock_chdk.get_script_status.return_value = (running, False)
+            with pytest.raises(RuntimeError) as caught:
+                dev.shoot(stream=True)
+            seen.append(str(caught.value))
+        assert seen[0] != seen[1]
+        for message in seen:
+            assert "support" not in message.lower()
+            assert "incompatible" not in message.lower()
 
     def test_an_initialization_failure_beats_the_early_status(self):
         dev, mock_chdk = self._make_device()

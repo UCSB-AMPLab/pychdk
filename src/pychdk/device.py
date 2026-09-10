@@ -250,7 +250,10 @@ class ChdkDevice:
         leaves both sides waiting on each other and the capture times
         out having never once asked whether data was ready. We service
         the camera while the script runs — readiness first, messages
-        second — and collect the script's result afterwards.
+        second. Once the picture is in hand the queue is cleared of
+        whatever the script left, which is housekeeping so the next
+        capture does not read a stale message: it is a bounded sweep of
+        what is already waiting, not a wait for a result still to come.
 
         Raises:
             RuntimeError: If the camera refuses to initialize remote
@@ -280,7 +283,8 @@ class ChdkDevice:
 
         image = None
         deadline = time.monotonic() + 30
-        init_deadline = time.monotonic() + CAPTURE_INIT_GRACE
+        grace = CAPTURE_INIT_GRACE
+        init_deadline = time.monotonic() + grace
         while time.monotonic() < deadline:
             ready, status = self._chdk.remote_capture_is_ready()
             formats = status
@@ -313,13 +317,21 @@ class ChdkDevice:
 
             # Checked after the queue, so a script that explained itself
             # is reported by its own words rather than by this status.
-            if status == REMOTE_CAP_NOTSET and (
-                not running or time.monotonic() >= init_deadline
-            ):
-                raise RuntimeError(
-                    "The camera never initialized remote capture: "
-                    "init_usb_capture did not take effect"
-                )
+            # The two ways of getting here are different observations
+            # and read differently in a bench log: a script that ran and
+            # did not initialize, versus one still going after we gave
+            # up waiting. Neither proves the camera cannot do this.
+            if status == REMOTE_CAP_NOTSET:
+                if not running:
+                    raise RuntimeError(
+                        "The capture script ended without initializing "
+                        "remote capture"
+                    )
+                if time.monotonic() >= init_deadline:
+                    raise RuntimeError(
+                        "The capture script did not initialize remote "
+                        f"capture within {grace}s and is still running"
+                    )
             if not running:
                 raise RuntimeError(
                     "The capture script finished without producing a capture"
