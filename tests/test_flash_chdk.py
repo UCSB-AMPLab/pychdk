@@ -122,6 +122,58 @@ class TestGetMountPoint:
         assert tool.get_mount_point("/dev/disk4") == str(tmp_path)
 
 
+class TestFormatCard:
+    """A format that did not come back mounted must not look like success."""
+
+    def test_a_reported_mount_point_proceeds(self, tmp_path, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(
+            tool, "_run", _dispatching_run(info={"MountPoint": str(tmp_path)}),
+        )
+        assert tool.format_card("/dev/disk4") == str(tmp_path)
+
+    def test_no_mount_point_stops_before_anything_is_extracted(
+        self, monkeypatch, capsys,
+    ):
+        tool = _load_tool()
+        monkeypatch.setattr(
+            tool, "_run", _dispatching_run(info={"DeviceIdentifier": "disk4s1"}),
+        )
+        with pytest.raises(SystemExit):
+            tool.format_card("/dev/disk4")
+        out = capsys.readouterr().out
+        assert "Nothing has been written" in out
+
+    def test_a_mount_point_that_is_not_there_stops(self, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(
+            tool, "_run",
+            _dispatching_run(info={"MountPoint": "/Volumes/NoSuchCard"}),
+        )
+        with pytest.raises(SystemExit):
+            tool.format_card("/dev/disk4")
+
+    def test_main_extracts_nothing_when_the_format_does_not_mount(
+        self, monkeypatch,
+    ):
+        tool = _load_tool()
+        extracted = []
+        monkeypatch.setattr(tool, "download_chdk", lambda: None)
+        monkeypatch.setattr(tool, "find_removable_disks", lambda: [])
+        monkeypatch.setattr(tool, "pick_disk", lambda disks: "/dev/disk4")
+        monkeypatch.setattr(tool, "_run", _dispatching_run(
+            info={"DeviceIdentifier": "disk4s1"},
+            layout=_blank_layout(),
+        ))
+        monkeypatch.setattr(
+            tool, "extract_chdk",
+            lambda zip_path, mount: extracted.append(mount),
+        )
+        with pytest.raises(SystemExit):
+            tool.main()
+        assert extracted == []
+
+
 class TestCameraIdSurvivesAReflash:
     def test_main_reads_the_id_before_it_erases_the_card(self, monkeypatch):
         tool = _load_tool()

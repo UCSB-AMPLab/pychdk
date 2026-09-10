@@ -115,10 +115,17 @@ def format_card(disk: str) -> str:
         "FAT32", VOLUME_LABEL,
         "MBRFormat", disk,
     ])
-    partition = disk + "s1"
-    info_result = _run(["diskutil", "info", "-plist", partition])
-    info = plistlib.loads(info_result.stdout.encode())
-    mount_point = info.get("MountPoint", f"/Volumes/{VOLUME_LABEL}")
+    # eraseDisk leaves the new volume mounted, so do not mount again —
+    # but insist that it really is mounted rather than guessing a path.
+    mount_point = get_mount_point(
+        disk,
+        mount=False,
+        context=(
+            f"{disk} was formatted and then did not come back as a "
+            "mounted volume. Nothing has been written to the card. "
+            "Reinsert it and run this again."
+        ),
+    )
     print(f"Formatted. Mounted at {mount_point}")
     return mount_point
 
@@ -179,18 +186,32 @@ def patch_boot_sector(disk: str):
     print("Boot sector patched.")
 
 
-def get_mount_point(disk: str) -> str:
-    """Mount the partition and return where it actually is.
+def _no_mount_point(reason: str, context: str):
+    """Report that there is no usable mount point, and stop."""
+    print(reason)
+    if context:
+        print(context)
+    sys.exit(1)
 
-    It used to fall back to /Volumes/<label> when the disk reported no
-    mount point, which is the worst possible answer: a path that looks
-    exactly like a real one, so callers reading a file there get a
-    plain "not found" from a directory that was never a card. The
-    identity check read that as a card carrying no id and let the card
-    be erased. A guessed path is worse than no path.
+
+def get_mount_point(disk: str, mount: bool = True, context: str = "") -> str:
+    """Return where the card's first partition is actually mounted.
+
+    This is the only place that decides what counts as a mount point,
+    and the only place that fails when there is not one. Both callers
+    used to fall back to /Volumes/<label> when the disk reported none,
+    which is the worst possible answer: a path that looks exactly like
+    a real one. Reading a file under it gives a plain "not found" from
+    a directory that was never a card, and writing under it succeeds
+    against the Mac's own filesystem.
 
     Args:
         disk: /dev/diskN path.
+        mount: Whether to mount first. False for a caller that has just
+            done something leaving the volume mounted, such as
+            eraseDisk, so the question is only ever asked one way.
+        context: Line printed after the reason when there is no usable
+            mount point, saying what the caller was in the middle of.
 
     Returns:
         The directory the card is actually mounted at.
@@ -200,19 +221,22 @@ def get_mount_point(disk: str) -> str:
             one that is not there.
     """
     partition = disk + "s1"
-    _run(["diskutil", "mount", partition])
+    if mount:
+        _run(["diskutil", "mount", partition])
     info_result = _run(["diskutil", "info", "-plist", partition])
     info = plistlib.loads(info_result.stdout.encode())
     mount_point = info.get("MountPoint")
     if not mount_point:
-        print(f"{partition} reports no mount point; it is not mounted.")
-        sys.exit(1)
-    if not Path(mount_point).is_dir():
-        print(
-            f"{partition} reports mount point {mount_point}, "
-            "which is not a directory that exists."
+        _no_mount_point(
+            f"{partition} reports no mount point; it is not mounted.",
+            context,
         )
-        sys.exit(1)
+    if not Path(mount_point).is_dir():
+        _no_mount_point(
+            f"{partition} reports mount point {mount_point}, "
+            "which is not a directory that exists.",
+            context,
+        )
     return mount_point
 
 
