@@ -290,8 +290,83 @@ def _entry_is_recognizably_blank(entry: dict) -> bool:
     return not _entry_holds_a_filesystem(entry)
 
 
+def _read_layout(disk: str) -> dict | None:
+    """Return diskutil's layout for the whole device, or None."""
+    result = _run(["diskutil", "list", "-plist", disk], check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        layout = plistlib.loads(result.stdout.encode())
+    except Exception:
+        return None
+    if not isinstance(layout, dict):
+        return None
+    return layout
+
+
+def _volumes_of(entry: dict) -> list:
+    """Every volume a whole-disk entry lists, however it lists them."""
+    parts = entry.get("Partitions") or []
+    volumes = entry.get("APFSVolumes") or []
+    if not isinstance(parts, list) or not isinstance(volumes, list):
+        return []
+    return list(parts) + list(volumes)
+
+
+def _layout_is_inspectable(layout: dict, disk: str) -> bool:
+    """Whether the card's layout is the one shape this tool can read.
+
+    The tool reads OWN.TXT from the first partition and nowhere else,
+    so the only card it can honestly say it has inspected is one whose
+    first partition is its only volume. A second volume, or a
+    filesystem sitting on the whole device, could hold a camera id we
+    would never look at — and a first partition that mounts and has no
+    OWN.TXT is then not evidence of anything.
+
+    Args:
+        layout: Parsed `diskutil list -plist` output.
+        disk: /dev/diskN path.
+
+    Returns:
+        True only for a single volume named <diskN>s1.
+    """
+    wanted = _disk_identifier(disk)
+    entries = layout.get("AllDisksAndPartitions")
+    if not isinstance(entries, list):
+        return False
+    described = [
+        entry for entry in entries
+        if isinstance(entry, dict) and entry.get("DeviceIdentifier") == wanted
+    ]
+    if len(described) != 1:
+        return False
+    volumes = _volumes_of(described[0])
+    if len(volumes) != 1 or not isinstance(volumes[0], dict):
+        return False
+    return volumes[0].get("DeviceIdentifier") == f"{wanted}s1"
+
+
+def _stop_uninspectable(reason: str):
+    """Refuse to erase a card we cannot honestly say we have read."""
+    print(reason)
+    print(
+        "Stopping before the card is erased: erasing it could destroy a "
+        "camera's identity. If you know this card is safe to erase, "
+        "erase it yourself and run this again."
+    )
+    sys.exit(1)
+
+
 def _classify_card(disk: str) -> str:
-    """Ask diskutil what the whole card holds.
+    """Ask diskutil what the whole card holds. See _classify_layout."""
+    layout = _read_layout(disk)
+    if layout is None:
+        return CARD_UNKNOWN
+    return _classify_layout(layout, disk)
+
+
+def _classify_layout(layout: dict, disk: str) -> str:
+    """Decide what a card holds from its parsed diskutil layout.
 
     Inspecting one partition cannot answer this: an existing but
     unformatted diskNs1 reports fine and then will not mount, and a
@@ -315,15 +390,6 @@ def _classify_card(disk: str) -> str:
     Returns:
         CARD_BLANK, CARD_HAS_FILESYSTEM or CARD_UNKNOWN.
     """
-    result = _run(["diskutil", "list", "-plist", disk], check=False)
-    if result.returncode != 0:
-        return CARD_UNKNOWN
-    try:
-        layout = plistlib.loads(result.stdout.encode())
-    except Exception:
-        return CARD_UNKNOWN
-    if not isinstance(layout, dict):
-        return CARD_UNKNOWN
     entries = layout.get("AllDisksAndPartitions")
     if not isinstance(entries, list) or not entries:
         # diskutil succeeded but told us nothing about this disk.
@@ -385,19 +451,31 @@ def read_existing_own_txt(disk: str) -> tuple[str | None, str | None]:
         SystemExit: If the card holds a filesystem that could not be
             inspected, so that no caller can go on to format it.
     """
+    layout = _read_layout(disk)
+    if layout is None:
+        _stop_uninspectable("The card's layout could not be read.")
+
+    classification = _classify_layout(layout, disk)
+    if classification == CARD_BLANK:
+        # Nothing on the card, so nothing to lose by erasing it.
+        print("Card holds no filesystem; treating it as blank.")
+        return None, None
+    if classification != CARD_HAS_FILESYSTEM:
+        _stop_uninspectable(
+            "The card's layout is not one this tool recognizes."
+        )
+    if not _layout_is_inspectable(layout, disk):
+        _stop_uninspectable(
+            "The card holds a layout this tool cannot inspect: it reads "
+            "OWN.TXT from the first partition only, and this card keeps "
+            "a filesystem somewhere else as well."
+        )
+
     mount_point = _mounted_path(disk)
     if mount_point is None:
-        if _classify_card(disk) == CARD_BLANK:
-            print("Card holds no filesystem; treating it as blank.")
-            return None, None
-        print(
-            "The card holds a filesystem that could not be inspected, "
-            "or its layout could not be read at all. Stopping before it "
-            "is erased: it may carry a camera id, and formatting would "
-            "lose that body's identity. Check the card and the reader, "
-            "then run this again."
+        _stop_uninspectable(
+            "The card holds a filesystem that could not be mounted."
         )
-        sys.exit(1)
 
     own_txt = Path(mount_point) / "OWN.TXT"
     try:

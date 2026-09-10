@@ -69,6 +69,35 @@ def _fake_run(layout=None, returncode=0, stdout=None):
     return run
 
 
+def _two_volume_layout():
+    """A card whose identity could live on a partition we never read."""
+    return {
+        "AllDisks": ["disk4", "disk4s1", "disk4s2"],
+        "AllDisksAndPartitions": [
+            {
+                "Content": "GUID_partition_scheme",
+                "DeviceIdentifier": "disk4",
+                "OSInternal": False,
+                "Partitions": [
+                    {
+                        "Content": "Microsoft Basic Data",
+                        "DeviceIdentifier": "disk4s1",
+                        "Size": 7965769728,
+                    },
+                    {
+                        "Content": "Apple_HFS",
+                        "DeviceIdentifier": "disk4s2",
+                        "Size": 7965769728,
+                    },
+                ],
+                "Size": 15931539456,
+            },
+        ],
+        "VolumesFromDisks": [],
+        "WholeDisks": ["disk4"],
+    }
+
+
 def _dispatching_run(info=None, layout=None):
     """Stand in for _run, answering `info` and `list` separately."""
 
@@ -304,7 +333,7 @@ class TestCameraIdSurvivesAReflash:
         monkeypatch.setattr(tool, "_run", _fake_run(PARTITIONED_LAYOUT))
         with pytest.raises(SystemExit):
             tool.read_existing_own_txt("/dev/disk4")
-        assert "could not be inspected" in capsys.readouterr().out
+        assert "could not be mounted" in capsys.readouterr().out
 
     def test_main_does_not_erase_a_volume_it_could_not_mount(
         self, monkeypatch,
@@ -455,6 +484,7 @@ class TestCameraIdSurvivesAReflash:
         # A path that exists but cannot be read as a file: not absence.
         (tmp_path / "OWN.TXT").mkdir()
         monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
+        monkeypatch.setattr(tool, "_run", _fake_run(PARTITIONED_LAYOUT))
         with pytest.raises(SystemExit):
             tool.read_existing_own_txt("/dev/disk4")
 
@@ -468,9 +498,76 @@ class TestCameraIdSurvivesAReflash:
         monkeypatch.setattr(tool, "find_removable_disks", lambda: [])
         monkeypatch.setattr(tool, "pick_disk", lambda disks: "/dev/disk4")
         monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
+        monkeypatch.setattr(tool, "_run", _fake_run(PARTITIONED_LAYOUT))
         monkeypatch.setattr(
             tool, "format_card", lambda disk: formatted.append(disk),
         )
         with pytest.raises(SystemExit):
             tool.main()
         assert formatted == []
+
+
+class TestOnlyAnInspectableLayoutMayBeErased:
+    """A mountable first partition is not an inspection of the card."""
+
+    def test_a_second_volume_stops_before_any_erase(
+        self, tmp_path, monkeypatch,
+    ):
+        tool = _load_tool()
+        formatted = []
+        monkeypatch.setattr(tool, "download_chdk", lambda: None)
+        monkeypatch.setattr(tool, "find_removable_disks", lambda: [])
+        monkeypatch.setattr(tool, "pick_disk", lambda disks: "/dev/disk4")
+        monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
+        monkeypatch.setattr(tool, "_run", _fake_run(_two_volume_layout()))
+        monkeypatch.setattr(
+            tool, "format_card", lambda disk: formatted.append(disk),
+        )
+        with pytest.raises(SystemExit):
+            tool.main()
+        assert formatted == []
+
+    def test_a_mountable_s1_with_another_volume_is_not_an_absence(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        tool = _load_tool()
+        # s1 mounts and has no OWN.TXT — but disk4s2 does, and we never
+        # look there, so this is not evidence the card has no identity.
+        monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
+        monkeypatch.setattr(tool, "_run", _fake_run(_two_volume_layout()))
+        with pytest.raises(SystemExit):
+            tool.read_existing_own_txt("/dev/disk4")
+        assert "cannot inspect" in capsys.readouterr().out
+
+    def test_a_single_inspectable_volume_proceeds(
+        self, tmp_path, monkeypatch,
+    ):
+        tool = _load_tool()
+        (tmp_path / "OWN.TXT").write_text("EVEN\nid=abc123def456\n")
+        monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
+        monkeypatch.setattr(tool, "_run", _fake_run(PARTITIONED_LAYOUT))
+        assert tool.read_existing_own_txt("/dev/disk4") == (
+            "EVEN", "abc123def456",
+        )
+
+    def test_a_blank_layout_proceeds_with_no_identity(self, monkeypatch):
+        tool = _load_tool()
+        monkeypatch.setattr(tool, "_run", _fake_run(_blank_layout()))
+        assert tool.read_existing_own_txt("/dev/disk4") == (None, None)
+
+    def test_a_filesystem_on_the_whole_device_is_not_inspectable(
+        self, tmp_path, monkeypatch,
+    ):
+        tool = _load_tool()
+        monkeypatch.setattr(tool, "get_mount_point", lambda disk: str(tmp_path))
+        monkeypatch.setattr(tool, "_run", _fake_run({
+            "AllDisksAndPartitions": [
+                {
+                    "Content": "Apple_HFS",
+                    "DeviceIdentifier": "disk4",
+                    "Size": 15931539456,
+                },
+            ],
+        }))
+        with pytest.raises(SystemExit):
+            tool.read_existing_own_txt("/dev/disk4")
