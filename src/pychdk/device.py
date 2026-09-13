@@ -187,6 +187,18 @@ class ChdkDevice:
     def is_connected(self):
         return self._connected
 
+    @property
+    def last_capture_chunks(self):
+        """How many chunks the last streamed capture arrived in.
+
+        Read after shoot(stream=True) rather than returned by it: the
+        return value is the picture, and MultiCam.shoot promises a list
+        of those, one per camera. The count lives per device, so after
+        a MultiCam shot each camera's own figure is on its entry in
+        MultiCam.cameras.
+        """
+        return self._chdk.last_capture_chunks
+
     def switch_mode(self, mode):
         """Switch camera to 'record' or 'play' mode.
 

@@ -44,6 +44,44 @@ class TestListDevices:
         assert list_devices() == []
 
 
+class TestCaptureChunkCountThroughShoot:
+    """Callers use shoot(), so the count has to be reachable from there."""
+
+    def _device_with_a_real_protocol(self):
+        info = DeviceInfo(
+            vendor_id=0x04A9, product_id=0x1234,
+            bus_num=1, device_num=5, serial_num="ABC",
+        )
+        mock_session = MagicMock()
+        with patch("pychdk.device.PTPDevice"), \
+             patch("pychdk.device.PTPSession", return_value=mock_session):
+            dev = ChdkDevice(info, _usb_device=MagicMock())
+        return dev, mock_session
+
+    def test_shoot_reports_how_many_chunks_arrived(self):
+        dev, session = self._device_with_a_real_protocol()
+        session.transaction.side_effect = [
+            ([7, 0], b""),                  # execute_script, id 7
+            ([0x01], b""),                  # ready, JPEG
+            ([4, 1, 0xFFFFFFFF], b"AAAA"),  # chunk 1
+            ([4, 0, 0xFFFFFFFF], b"BBBB"),  # chunk 2, the last
+            ([0], b""),                     # drain: nothing waiting
+        ]
+        assert dev.shoot(stream=True) == b"AAAABBBB"
+        assert dev.last_capture_chunks == 2
+
+    def test_a_one_chunk_still_reports_one(self):
+        dev, session = self._device_with_a_real_protocol()
+        session.transaction.side_effect = [
+            ([7, 0], b""),
+            ([0x01], b""),
+            ([4, 0, 0xFFFFFFFF], b"JPEG"),
+            ([0], b""),
+        ]
+        assert dev.shoot(stream=True) == b"JPEG"
+        assert dev.last_capture_chunks == 1
+
+
 class TestConstructionIsExceptionSafe:
     """A claim taken during construction must not outlive the failure."""
 
