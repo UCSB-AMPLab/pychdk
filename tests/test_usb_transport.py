@@ -156,6 +156,22 @@ class TestPTPDevice:
 
     @patch("pychdk.usb_transport.usb.util.release_interface")
     @patch("pychdk.usb_transport.usb.util.claim_interface")
+    def test_a_failed_open_disables_the_pyusb_finalizer(
+        self, mock_claim, mock_release,
+    ):
+        mock_dev = _make_mock_usb_device_without_bulk_endpoints()
+        mock_dev._finalize_called = False
+        ptp = PTPDevice(mock_dev)
+        with pytest.raises(RuntimeError, match="bulk endpoints"):
+            ptp.open()
+        # Releasing the claim is not enough: a device we opened far
+        # enough to touch must not be left to pyusb's finalizer, which
+        # can reopen a freed context at shutdown and take the process
+        # with it. Trading a leak for a crash is the worse bargain.
+        assert mock_dev._finalize_called is True
+
+    @patch("pychdk.usb_transport.usb.util.release_interface")
+    @patch("pychdk.usb_transport.usb.util.claim_interface")
     def test_a_failed_open_in_a_with_block_claims_nothing(
         self, mock_claim, mock_release,
     ):

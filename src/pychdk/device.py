@@ -481,9 +481,18 @@ class ChdkDevice:
     def close(self):
         """Close the connection to the camera.
 
-        Safe to call more than once, and safe against a concurrent
-        closer on the same device. PTPDevice.close says why, and where
-        in pyusb to check it.
+        Safe to call more than once in sequence.
+
+        Concurrently it is safe in one half and not the other, and the
+        halves are worth keeping apart. Releasing the USB interface is
+        serialised by pyusb itself, so two closers cannot double-release
+        it — PTPDevice.close carries the citation. Closing the PTP
+        session is not serialised: this sends a close over the wire, and
+        two threads can both find the session open and both send one,
+        because nothing here guards that. So a host that shares one
+        device across threads has to serialise its own teardown.
+        Nothing in this library shares one: MultiCam gives each worker
+        its own device.
         """
         self._connected = False
         _open_devices.discard(self)

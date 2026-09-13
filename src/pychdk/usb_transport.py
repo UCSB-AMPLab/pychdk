@@ -200,6 +200,12 @@ class PTPDevice:
             # in close().
             self._dev._finalize_called = True
         except BaseException:
+            # Take ownership of cleanup before letting go. The
+            # finalizer disabled above is no less dangerous on a device
+            # we opened part way: releasing the claim and then leaving
+            # pyusb to reopen a freed context at shutdown would trade a
+            # leaked interface for a killed process.
+            self._dev._finalize_called = True
             try:
                 self.close()
             except Exception:
