@@ -213,13 +213,16 @@ class PTPSession:
         return data[:total_length - CONTAINER_HEADER_SIZE]
 
     def __enter__(self):
-        # No rollback here, deliberately: unlike PTPDevice.open, a
-        # failed session open holds no operating-system resource. It
-        # raises only when the camera refused OPEN_SESSION, so there is
-        # no session to close and nothing claimed. The one asymmetry,
-        # should it ever matter: if the command reached the camera and
-        # the response read failed, the camera may hold a session we
-        # would not close, because close() returns early on _is_open.
+        # No rollback here, deliberately. The property: a session open
+        # that raises holds no operating-system resource, whatever
+        # raised it. Nothing is claimed, so there is nothing to give
+        # back, which is what makes this unlike PTPDevice.open.
+        #
+        # Not covered: the camera's own state. If OPEN_SESSION reached
+        # the camera and we failed before recording the session, the
+        # camera may hold one we will never close, since close()
+        # returns early on _is_open — and nothing on this side can tell
+        # that from a session that was never opened at all.
         self.open()
         return self
 
