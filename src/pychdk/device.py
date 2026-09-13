@@ -157,17 +157,53 @@ class ChdkDevice:
         self._open()
 
     def _open(self):
-        self._transport.open()
-        self._session.open()
-        self._connected = True
-        _open_devices.add(self)
-        # Re-register so our cleanup runs before any pyusb finalizers
-        # that were registered during device creation (atexit is LIFO).
-        atexit.register(_cleanup_all)
+        """Claim the interface and open a session, or claim nothing.
+
+        Until the device is tracked there is nothing for the caller to
+        close: a constructor that raised here left the interface
+        claimed with no object to release it, so a host retrying
+        enumeration piled up claims on a port until the camera was
+        unplugged. Anything that fails past the claim gives it back —
+        including a failure inside the transport's own open, which can
+        hold a claim and still raise.
+        """
+        try:
+            self._transport.open()
+            self._session.open()
+            self._connected = True
+            _open_devices.add(self)
+            # Re-register so our cleanup runs before any pyusb finalizers
+            # that were registered during device creation (atexit is LIFO).
+            atexit.register(_cleanup_all)
+        except BaseException:
+            self._connected = False
+            _open_devices.discard(self)
+            try:
+                self._transport.close()
+            except Exception:
+                pass
+            raise
 
     @property
     def is_connected(self):
         return self._connected
+
+    @property
+    def last_capture_chunks(self):
+        """How many chunks the last streamed capture arrived in.
+
+        Read after shoot(stream=True) rather than returned by it: the
+        return value is the picture, and MultiCam.shoot promises a list
+        of those, one per camera. The count lives per device, so after
+        a MultiCam shot each camera's own figure is on its entry in
+        MultiCam.cameras.
+
+        Zero means no chunk arrived, not that no capture was tried.
+        Read it from the thread that took the shot, or once that thread
+        has finished: MultiCam shoots on a pool, and a reader looking
+        at another worker's device mid-capture sees a partial count.
+        """
+        return self._chdk.last_capture_chunks
 
     def switch_mode(self, mode):
         """Switch camera to 'record' or 'play' mode.
@@ -239,6 +275,11 @@ class ChdkDevice:
     def _shoot_streaming(self, setup_parts, dng):
         """Capture using remote capture (PTP commands 13/14).
 
+        The chunk count is zeroed here, at the attempt, rather than
+        where the download begins: a capture refused, or one that never
+        becomes ready, would otherwise keep reporting the chunks of the
+        capture before it.
+
         Setup and shutter go out as one script, because a second script
         kills the first unless NOKILL is set ("if script is running
         return error instead of killing", core/ptp.h) — so a separate
@@ -266,6 +307,8 @@ class ChdkDevice:
                 file. This method downloads one format, so it cannot,
                 and _shoot_standard does not request a DNG either.
         """
+        self._chdk.reset_capture_chunks()
+
         if dng:
             raise NotImplementedError(
                 "DNG capture is not implemented. Streaming would need the "
@@ -431,13 +474,26 @@ class ChdkDevice:
         except Exception:
             pass
         time.sleep(wait)
-        self._transport.open()
-        self._session.open()
-        self._connected = True
-        _open_devices.add(self)
+        # Same claim, same rollback: a reopen that fails mid-session
+        # leaks exactly as a failed construction did.
+        self._open()
 
     def close(self):
-        """Close the connection to the camera."""
+        """Close the connection to the camera.
+
+        Safe to call more than once in sequence.
+
+        Concurrently it is safe in one half and not the other, and the
+        halves are worth keeping apart. Releasing the USB interface is
+        serialised by pyusb itself, so two closers cannot double-release
+        it — PTPDevice.close carries the citation. Closing the PTP
+        session is not serialised: this sends a close over the wire, and
+        two threads can both find the session open and both send one,
+        because nothing here guards that. So a host that shares one
+        device across threads has to serialise its own teardown.
+        Nothing in this library shares one: MultiCam gives each worker
+        its own device.
+        """
         self._connected = False
         _open_devices.discard(self)
         try:

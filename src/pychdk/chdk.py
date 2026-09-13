@@ -156,6 +156,35 @@ class ChdkPTP:
 
     def __init__(self, session):
         self._session = session
+        self._last_capture_chunks = 0
+
+    @property
+    def last_capture_chunks(self):
+        """How many chunks the last remote capture arrived in.
+
+        Zeroed when a capture is attempted and incremented as each
+        chunk lands, so it is readable — and still true — after a
+        capture that failed part way through, and reads zero after one
+        that never got a chunk at all. A still that arrives in one
+        chunk and one that arrives in forty say different things about
+        the wire, and there is one bench session to find out which of
+        them a real camera does.
+
+        Read it from the thread that ran the capture, or after that
+        thread has finished: a reader watching from elsewhere while a
+        capture is in flight sees a partial count, since it rises as
+        the chunks arrive.
+        """
+        return self._last_capture_chunks
+
+    def reset_capture_chunks(self):
+        """Zero the chunk count at the start of a capture attempt.
+
+        Called by the caller that begins a capture, because a capture
+        can fail before any download is attempted and must not go on
+        reporting the previous capture's chunks.
+        """
+        self._last_capture_chunks = 0
 
     def get_version(self):
         """Get CHDK PTP protocol version.
@@ -404,6 +433,9 @@ class ChdkPTP:
         Args:
             format_flag: Which format to download (JPEG=1, RAW=2, DNG_HDR=4).
 
+        The chunk count is left in last_capture_chunks rather than
+        returned, so the signature callers depend on is unchanged.
+
         Returns:
             Image data as bytes.
 
@@ -412,8 +444,10 @@ class ChdkPTP:
         """
         image = bytearray()
         cursor = 0
+        self._last_capture_chunks = 0
         for _ in range(MAX_CAPTURE_CHUNKS):
             chunk, more, position = self.remote_capture_get_chunk(format_flag)
+            self._last_capture_chunks += 1
             if position >= 0:
                 cursor = position
             end = cursor + len(chunk)

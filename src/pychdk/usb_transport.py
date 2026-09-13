@@ -90,6 +90,11 @@ class PTPDevice:
         self._ep_out = None
         self._ep_int = None
         self._intf_num = None
+        # The interface we actually hold, set the moment the claim
+        # succeeds rather than when opening finishes. Everything
+        # between the claim and the end of open() can fail, and what
+        # is held has to be releasable in between.
+        self._claimed_intf = None
         self._is_open = False
 
     @property
@@ -116,7 +121,15 @@ class PTPDevice:
             return None
 
     def open(self):
-        """Open the PTP device — claim interface and find endpoints."""
+        """Open the PTP device — claim interface and find endpoints.
+
+        Either this returns with the interface claimed, or it raises
+        having claimed nothing. That guarantee lives here rather than
+        in each caller because it was a convention before, and three
+        call sites independently failed to honour it: a claim taken
+        and then lost to an exception is held until the camera is
+        unplugged, and every caller had to remember that separately.
+        """
         if self._is_open:
             return
 
@@ -154,40 +167,82 @@ class PTPDevice:
                 pass
 
         usb.util.claim_interface(self._dev, self._intf_num)
+        self._claimed_intf = self._intf_num
 
-        # Find endpoints
-        intf = cfg[(self._intf_num, 0)]
-        for ep in intf:
-            attr = ep.bmAttributes & 0x03  # transfer type mask
-            direction = ep.bEndpointAddress & 0x80  # direction mask
-            if attr == usb.util.ENDPOINT_TYPE_BULK:
-                if direction == EP_DIR_IN:
-                    self._ep_in = ep
-                else:
-                    self._ep_out = ep
-            elif attr == usb.util.ENDPOINT_TYPE_INTR:
-                if direction == EP_DIR_IN:
-                    self._ep_int = ep
+        # Everything past the claim runs under the guarantee: if it
+        # raises, the interface goes back before the exception does.
+        try:
+            # Find endpoints
+            intf = cfg[(self._intf_num, 0)]
+            for ep in intf:
+                attr = ep.bmAttributes & 0x03  # transfer type mask
+                direction = ep.bEndpointAddress & 0x80  # direction mask
+                if attr == usb.util.ENDPOINT_TYPE_BULK:
+                    if direction == EP_DIR_IN:
+                        self._ep_in = ep
+                    else:
+                        self._ep_out = ep
+                elif attr == usb.util.ENDPOINT_TYPE_INTR:
+                    if direction == EP_DIR_IN:
+                        self._ep_int = ep
 
-        if self._ep_in is None or self._ep_out is None:
-            raise RuntimeError("Could not find bulk endpoints on PTP device")
+            if self._ep_in is None or self._ep_out is None:
+                raise RuntimeError(
+                    "Could not find bulk endpoints on PTP device"
+                )
 
-        self._is_open = True
+            self._is_open = True
 
-        # Disable pyusb's weakref.finalize cleanup for this Device.
-        # During Python shutdown, pyusb's finalizer can call libusb_open
-        # after the libusb context has been freed, causing a SIGSEGV.
-        # We handle all USB cleanup ourselves in close().
-        self._dev._finalize_called = True
+            # Disable pyusb's weakref.finalize cleanup for this Device.
+            # During Python shutdown, pyusb's finalizer can call
+            # libusb_open after the libusb context has been freed,
+            # causing a SIGSEGV. We handle all USB cleanup ourselves
+            # in close().
+            self._dev._finalize_called = True
+        except BaseException:
+            # Take ownership of cleanup before letting go. The
+            # finalizer disabled above is no less dangerous on a device
+            # we opened part way: releasing the claim and then leaving
+            # pyusb to reopen a freed context at shutdown would trade a
+            # leaked interface for a killed process.
+            self._dev._finalize_called = True
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     def close(self):
-        """Release the USB interface and dispose of device resources."""
-        if not self._is_open:
+        """Release whatever is held, however far open() got.
+
+        Opening claims the interface and then goes looking for
+        endpoints, so a device can own a claim while still failing to
+        open. Keying this on _is_open made close() a no-op in exactly
+        that case, and the claim was then held until the camera was
+        unplugged. It keys on the claim instead.
+
+        Repeated closes are safe in sequence, and two threads calling
+        close at once are safe as well, so there is no lock of our own
+        here. pyusb serialises claiming and releasing on a reentrant
+        lock it holds itself, and releases only an interface it still
+        records as claimed: in usb/core.py, _ResourceManager keeps a
+        threading.RLock, managed_claim_interface and
+        managed_release_interface are both decorated @synchronized
+        against it, and the release calls the backend only when the
+        interface is in its claimed set, removing it in a finally — so
+        a second release for the same interface does nothing, and a
+        repeated claim does not double-claim for the same reason.
+        Checked against the installed pyusb (1.3.1) rather than
+        assumed; worth a re-read if that version moves.
+        """
+        if self._claimed_intf is None and not self._is_open:
             return
-        try:
-            usb.util.release_interface(self._dev, self._intf_num)
-        except usb.core.USBError:
-            pass
+        if self._claimed_intf is not None:
+            try:
+                usb.util.release_interface(self._dev, self._claimed_intf)
+            except usb.core.USBError:
+                pass
+            self._claimed_intf = None
         try:
             usb.util.dispose_resources(self._dev)
         except usb.core.USBError:
@@ -205,7 +260,23 @@ class PTPDevice:
         return bytes(self._ep_in.read(size, timeout=timeout))
 
     def __enter__(self):
-        self.open()
+        """Open on the way in, giving the claim back if opening fails.
+
+        Python does not call __exit__ when __enter__ raises, so nothing
+        outside the with block can release the interface: the rollback
+        has to be here. This is the third place the same fault turned
+        up — construction, reconnect, and now here — because open()
+        can claim and then raise, and every caller is left to remember
+        that separately.
+        """
+        try:
+            self.open()
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
         return self
 
     def __exit__(self, *args):

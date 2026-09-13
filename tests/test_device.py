@@ -8,13 +8,19 @@ import pytest
 import pychdk
 from pychdk import device
 from pychdk.chdk import (
+    ChdkCommand,
     MessageType,
     REMOTE_CAP_NOTSET,
     ScriptDataType,
     ScriptErrorType,
     ScriptMessage,
 )
-from pychdk.device import ChdkDevice, list_devices, DeviceInfo
+from pychdk.device import (
+    ChdkDevice,
+    list_devices,
+    DeviceInfo,
+    _open_devices,
+)
 
 
 class TestListDevices:
@@ -37,6 +43,230 @@ class TestListDevices:
     def test_empty_when_no_cameras(self, mock_find):
         mock_find.return_value = []
         assert list_devices() == []
+
+
+class _FakeClock:
+    """Stands in for the time module inside pychdk.device.
+
+    monotonic() walks a scripted sequence and then holds its last
+    value, so a thirty-second deadline can be reached in no time at
+    all; sleep() records what was asked for without waiting.
+    """
+
+    def __init__(self, readings):
+        self._readings = list(readings)
+        self.slept = 0.0
+
+    def monotonic(self):
+        if len(self._readings) > 1:
+            return self._readings.pop(0)
+        return self._readings[0]
+
+    def sleep(self, seconds):
+        self.slept += seconds
+
+
+class TestCaptureChunkCountThroughShoot:
+    """Callers use shoot(), so the count has to be reachable from there."""
+
+    def _device_with_a_real_protocol(self):
+        info = DeviceInfo(
+            vendor_id=0x04A9, product_id=0x1234,
+            bus_num=1, device_num=5, serial_num="ABC",
+        )
+        mock_session = MagicMock()
+        with patch("pychdk.device.PTPDevice"), \
+             patch("pychdk.device.PTPSession", return_value=mock_session):
+            dev = ChdkDevice(info, _usb_device=MagicMock())
+        return dev, mock_session
+
+    def test_shoot_reports_how_many_chunks_arrived(self):
+        dev, session = self._device_with_a_real_protocol()
+        session.transaction.side_effect = [
+            ([7, 0], b""),                  # execute_script, id 7
+            ([0x01], b""),                  # ready, JPEG
+            ([4, 1, 0xFFFFFFFF], b"AAAA"),  # chunk 1
+            ([4, 0, 0xFFFFFFFF], b"BBBB"),  # chunk 2, the last
+            ([0], b""),                     # drain: nothing waiting
+        ]
+        assert dev.shoot(stream=True) == b"AAAABBBB"
+        assert dev.last_capture_chunks == 2
+
+    def test_a_capture_that_never_downloads_reports_nothing(self):
+        dev, session = self._device_with_a_real_protocol()
+        session.transaction.side_effect = [
+            ([7, 0], b""),                  # first capture: two chunks
+            ([0x01], b""),
+            ([4, 1, 0xFFFFFFFF], b"AAAA"),
+            ([4, 0, 0xFFFFFFFF], b"BBBB"),
+            ([0], b""),
+        ]
+        assert dev.shoot(stream=True) == b"AAAABBBB"
+        assert dev.last_capture_chunks == 2
+
+        session.transaction.side_effect = [
+            ([8, 0], b""),                  # second: script starts
+            ([0], b""),                     # nothing ready
+            ([0], b""),                     # and the script has ended
+        ]
+        with pytest.raises(RuntimeError, match="without producing a capture"):
+            dev.shoot(stream=True)
+        # No chunk arrived, so reporting two would be a lie a bench
+        # reader would believe.
+        assert dev.last_capture_chunks == 0
+
+    def test_a_refused_capture_reports_nothing(self):
+        dev, session = self._device_with_a_real_protocol()
+        session.transaction.side_effect = [
+            ([7, 0], b""),
+            ([0x01], b""),
+            ([4, 0, 0xFFFFFFFF], b"JPEG"),
+            ([0], b""),
+        ]
+        assert dev.shoot(stream=True) == b"JPEG"
+        assert dev.last_capture_chunks == 1
+
+        with pytest.raises(NotImplementedError):
+            dev.shoot(dng=True, stream=True)
+        assert dev.last_capture_chunks == 0
+
+    def test_a_second_capture_that_ends_without_data_reports_nothing(
+        self, monkeypatch,
+    ):
+        dev, session = self._device_with_a_real_protocol()
+        session.transaction.side_effect = [
+            ([7, 0], b""),
+            ([0x01], b""),
+            ([4, 0, 0xFFFFFFFF], b"JPEG"),
+            ([0], b""),
+        ]
+        assert dev.shoot(stream=True) == b"JPEG"
+        assert dev.last_capture_chunks == 1
+
+        # Nothing ready and the script already finished: this ends on
+        # the script-ended path, not at the deadline. See
+        # test_a_capture_that_runs_out_its_deadline_reports_nothing.
+        session.transaction.side_effect = None
+        session.transaction.return_value = ([0], b"")
+        monkeypatch.setattr("pychdk.device.CAPTURE_INIT_GRACE", 0.0)
+        with pytest.raises(RuntimeError, match="without producing a capture"):
+            dev.shoot(stream=True)
+        assert dev.last_capture_chunks == 0
+
+    def test_a_capture_that_runs_out_its_deadline_reports_nothing(
+        self, monkeypatch,
+    ):
+        dev, session = self._device_with_a_real_protocol()
+        session.transaction.side_effect = [
+            ([7, 0], b""),
+            ([0x01], b""),
+            ([4, 0, 0xFFFFFFFF], b"JPEG"),
+            ([0], b""),
+        ]
+        assert dev.shoot(stream=True) == b"JPEG"
+        assert dev.last_capture_chunks == 1
+
+        # A camera that stays busy and never becomes ready. The clock is
+        # driven rather than waited on: the deadline is thirty seconds
+        # and the suite must not spend them.
+        def respond(operation, params=None, **kwargs):
+            command = params[0]
+            if command == ChdkCommand.EXECUTE_SCRIPT:
+                return ([8, 0], b"")
+            if command == ChdkCommand.REMOTE_CAPTURE_IS_READY:
+                return ([0], b"")       # never ready
+            if command == ChdkCommand.SCRIPT_STATUS:
+                return ([0b01], b"")    # still running, nothing to say
+            return ([0], b"")
+
+        session.transaction.side_effect = respond
+        clock = _FakeClock([0.0, 0.0, 0.0, 0.0, 999.0])
+        monkeypatch.setattr("pychdk.device.time", clock)
+
+        # TimeoutError, not RuntimeError: only the deadline raises this.
+        with pytest.raises(TimeoutError, match="did not complete"):
+            dev.shoot(stream=True)
+        assert dev.last_capture_chunks == 0
+        # It really went round the loop rather than falling straight out.
+        assert clock.slept > 0
+
+    def test_a_one_chunk_still_reports_one(self):
+        dev, session = self._device_with_a_real_protocol()
+        session.transaction.side_effect = [
+            ([7, 0], b""),
+            ([0x01], b""),
+            ([4, 0, 0xFFFFFFFF], b"JPEG"),
+            ([0], b""),
+        ]
+        assert dev.shoot(stream=True) == b"JPEG"
+        assert dev.last_capture_chunks == 1
+
+
+class TestConstructionIsExceptionSafe:
+    """A claim taken during construction must not outlive the failure."""
+
+    def _info(self):
+        return DeviceInfo(
+            vendor_id=0x04A9, product_id=0x1234,
+            bus_num=1, device_num=5, serial_num="ABC",
+        )
+
+    def test_a_failed_session_releases_the_transport(self):
+        tracked_before = len(_open_devices)
+        with patch("pychdk.device.PTPDevice") as MockTransport, \
+             patch("pychdk.device.PTPSession") as MockSession, \
+             patch("pychdk.device.ChdkPTP"):
+            MockSession.return_value.open.side_effect = RuntimeError(
+                "session refused",
+            )
+            with pytest.raises(RuntimeError, match="session refused"):
+                ChdkDevice(self._info(), _usb_device=MagicMock())
+            transport = MockTransport.return_value
+            transport.open.assert_called_once()
+            # One open, one close: the claim does not survive the raise.
+            transport.close.assert_called_once()
+        assert len(_open_devices) == tracked_before
+
+    def test_a_failed_transport_open_is_also_released(self):
+        tracked_before = len(_open_devices)
+        with patch("pychdk.device.PTPDevice") as MockTransport, \
+             patch("pychdk.device.PTPSession"), \
+             patch("pychdk.device.ChdkPTP"):
+            # A transport that claims the interface and then fails
+            # finding endpoints raises out of open() itself.
+            MockTransport.return_value.open.side_effect = RuntimeError(
+                "Could not find bulk endpoints on PTP device",
+            )
+            with pytest.raises(RuntimeError, match="bulk endpoints"):
+                ChdkDevice(self._info(), _usb_device=MagicMock())
+            MockTransport.return_value.close.assert_called_once()
+        assert len(_open_devices) == tracked_before
+
+    def test_a_failed_construction_tracks_nothing(self):
+        tracked_before = len(_open_devices)
+        with patch("pychdk.device.PTPDevice"), \
+             patch("pychdk.device.PTPSession") as MockSession, \
+             patch("pychdk.device.ChdkPTP"):
+            MockSession.return_value.open.side_effect = RuntimeError("nope")
+            with pytest.raises(RuntimeError):
+                ChdkDevice(self._info(), _usb_device=MagicMock())
+        # Nothing for _cleanup_all to find, and no half-built device.
+        assert len(_open_devices) == tracked_before
+
+    def test_a_failed_reconnect_also_releases_the_transport(self):
+        with patch("pychdk.device.PTPDevice") as MockTransport, \
+             patch("pychdk.device.PTPSession") as MockSession, \
+             patch("pychdk.device.ChdkPTP"):
+            dev = ChdkDevice(self._info(), _usb_device=MagicMock())
+            transport = MockTransport.return_value
+            transport.close.reset_mock()
+            MockSession.return_value.open.side_effect = RuntimeError("gone")
+            with pytest.raises(RuntimeError, match="gone"):
+                dev.reconnect(wait=0)
+            # Closed once on the way down, once releasing the failed open.
+            assert transport.close.call_count == 2
+            assert dev not in _open_devices
+            assert not dev.is_connected
 
 
 class TestChdkDevice:

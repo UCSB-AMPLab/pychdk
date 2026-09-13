@@ -17,6 +17,39 @@ class TestMultiCam:
         assert len(mc.cameras) == 2
 
     @patch("pychdk.multicam.list_devices")
+    @patch("pychdk.multicam.ChdkDevice")
+    def test_a_second_camera_that_fails_closes_the_first(
+        self, MockDevice, mock_list,
+    ):
+        mock_list.return_value = [
+            DeviceInfo(0x04A9, 0x1234, 1, 5, "AAA"),
+            DeviceInfo(0x04A9, 0x1234, 1, 6, "BBB"),
+        ]
+        first = MagicMock()
+        MockDevice.side_effect = [first, RuntimeError("camera 2 will not open")]
+
+        with pytest.raises(RuntimeError, match="camera 2 will not open"):
+            MultiCam()
+
+        # The half-built MultiCam is discarded, so nothing else can
+        # ever close camera one: it would be claimed by a process with
+        # no handle on it until the card was unplugged.
+        first.close.assert_called_once()
+
+    @patch("pychdk.multicam.list_devices")
+    @patch("pychdk.multicam.ChdkDevice")
+    def test_a_first_camera_that_fails_closes_nothing(
+        self, MockDevice, mock_list,
+    ):
+        mock_list.return_value = [
+            DeviceInfo(0x04A9, 0x1234, 1, 5, "AAA"),
+            DeviceInfo(0x04A9, 0x1234, 1, 6, "BBB"),
+        ]
+        MockDevice.side_effect = RuntimeError("camera 1 will not open")
+        with pytest.raises(RuntimeError, match="camera 1 will not open"):
+            MultiCam()
+
+    @patch("pychdk.multicam.list_devices")
     def test_no_cameras_raises(self, mock_list):
         mock_list.return_value = []
         with pytest.raises(RuntimeError, match="No CHDK cameras found"):

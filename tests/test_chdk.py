@@ -379,6 +379,52 @@ class TestRemoteCaptureGetData:
             chdk.remote_capture_get_data(1)
 
 
+class TestCaptureChunkCount:
+    """How many chunks a still arrived in is a bench observation."""
+
+    def _make_chdk(self):
+        mock_session = MagicMock()
+        return ChdkPTP(mock_session), mock_session
+
+    def test_it_starts_at_zero(self):
+        chdk, _ = self._make_chdk()
+        assert chdk.last_capture_chunks == 0
+
+    def test_it_counts_the_chunks_of_a_capture(self):
+        chdk, session = self._make_chdk()
+        session.transaction.side_effect = [
+            ([4, 1, 0xFFFFFFFF], b"AAAA"),
+            ([4, 1, 0xFFFFFFFF], b"BBBB"),
+            ([4, 0, 0xFFFFFFFF], b"CCCC"),
+        ]
+        chdk.remote_capture_get_data(1)
+        assert chdk.last_capture_chunks == 3
+
+    def test_a_later_capture_does_not_inherit_the_count(self):
+        chdk, session = self._make_chdk()
+        session.transaction.side_effect = [
+            ([4, 1, 0xFFFFFFFF], b"AAAA"),
+            ([4, 0, 0xFFFFFFFF], b"BBBB"),
+        ]
+        chdk.remote_capture_get_data(1)
+        assert chdk.last_capture_chunks == 2
+        session.transaction.side_effect = [([4, 0, 0xFFFFFFFF], b"ZZZZ")]
+        chdk.remote_capture_get_data(1)
+        assert chdk.last_capture_chunks == 1
+
+    def test_the_count_survives_a_capture_that_failed_part_way(self):
+        chdk, session = self._make_chdk()
+        session.transaction.side_effect = [
+            ([4, 1, 0xFFFFFFFF], b"AAAA"),
+            ([4, 1, 0xFFFFFFFF], b"BBBB"),
+            RuntimeError("cable"),
+        ]
+        with pytest.raises(RuntimeError, match="cable"):
+            chdk.remote_capture_get_data(1)
+        # Two arrived before it broke, which is worth knowing.
+        assert chdk.last_capture_chunks == 2
+
+
 class TestRemoteCaptureGetChunk:
     def _make_chdk(self):
         mock_session = MagicMock()
