@@ -197,6 +197,11 @@ class ChdkDevice:
         of those, one per camera. The count lives per device, so after
         a MultiCam shot each camera's own figure is on its entry in
         MultiCam.cameras.
+
+        Zero means no chunk arrived, not that no capture was tried.
+        Read it from the thread that took the shot, or once that thread
+        has finished: MultiCam shoots on a pool, and a reader looking
+        at another worker's device mid-capture sees a partial count.
         """
         return self._chdk.last_capture_chunks
 
@@ -270,6 +275,11 @@ class ChdkDevice:
     def _shoot_streaming(self, setup_parts, dng):
         """Capture using remote capture (PTP commands 13/14).
 
+        The chunk count is zeroed here, at the attempt, rather than
+        where the download begins: a capture refused, or one that never
+        becomes ready, would otherwise keep reporting the chunks of the
+        capture before it.
+
         Setup and shutter go out as one script, because a second script
         kills the first unless NOKILL is set ("if script is running
         return error instead of killing", core/ptp.h) — so a separate
@@ -297,6 +307,8 @@ class ChdkDevice:
                 file. This method downloads one format, so it cannot,
                 and _shoot_standard does not request a DNG either.
         """
+        self._chdk.reset_capture_chunks()
+
         if dng:
             raise NotImplementedError(
                 "DNG capture is not implemented. Streaming would need the "

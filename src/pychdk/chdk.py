@@ -162,14 +162,29 @@ class ChdkPTP:
     def last_capture_chunks(self):
         """How many chunks the last remote capture arrived in.
 
-        Reset when a capture starts and incremented as each chunk
-        lands, so it is readable — and still true — after a capture
-        that failed part way through. A still that arrives in one
-        chunk and one that arrives in forty say different things
-        about the wire, and there is one bench session to find out
-        which of them a real camera does.
+        Zeroed when a capture is attempted and incremented as each
+        chunk lands, so it is readable — and still true — after a
+        capture that failed part way through, and reads zero after one
+        that never got a chunk at all. A still that arrives in one
+        chunk and one that arrives in forty say different things about
+        the wire, and there is one bench session to find out which of
+        them a real camera does.
+
+        Read it from the thread that ran the capture, or after that
+        thread has finished: a reader watching from elsewhere while a
+        capture is in flight sees a partial count, since it rises as
+        the chunks arrive.
         """
         return self._last_capture_chunks
+
+    def reset_capture_chunks(self):
+        """Zero the chunk count at the start of a capture attempt.
+
+        Called by the caller that begins a capture, because a capture
+        can fail before any download is attempted and must not go on
+        reporting the previous capture's chunks.
+        """
+        self._last_capture_chunks = 0
 
     def get_version(self):
         """Get CHDK PTP protocol version.

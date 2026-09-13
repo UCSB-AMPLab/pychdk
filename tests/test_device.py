@@ -70,6 +70,63 @@ class TestCaptureChunkCountThroughShoot:
         assert dev.shoot(stream=True) == b"AAAABBBB"
         assert dev.last_capture_chunks == 2
 
+    def test_a_capture_that_never_downloads_reports_nothing(self):
+        dev, session = self._device_with_a_real_protocol()
+        session.transaction.side_effect = [
+            ([7, 0], b""),                  # first capture: two chunks
+            ([0x01], b""),
+            ([4, 1, 0xFFFFFFFF], b"AAAA"),
+            ([4, 0, 0xFFFFFFFF], b"BBBB"),
+            ([0], b""),
+        ]
+        assert dev.shoot(stream=True) == b"AAAABBBB"
+        assert dev.last_capture_chunks == 2
+
+        session.transaction.side_effect = [
+            ([8, 0], b""),                  # second: script starts
+            ([0], b""),                     # nothing ready
+            ([0], b""),                     # and the script has ended
+        ]
+        with pytest.raises(RuntimeError, match="without producing a capture"):
+            dev.shoot(stream=True)
+        # No chunk arrived, so reporting two would be a lie a bench
+        # reader would believe.
+        assert dev.last_capture_chunks == 0
+
+    def test_a_refused_capture_reports_nothing(self):
+        dev, session = self._device_with_a_real_protocol()
+        session.transaction.side_effect = [
+            ([7, 0], b""),
+            ([0x01], b""),
+            ([4, 0, 0xFFFFFFFF], b"JPEG"),
+            ([0], b""),
+        ]
+        assert dev.shoot(stream=True) == b"JPEG"
+        assert dev.last_capture_chunks == 1
+
+        with pytest.raises(NotImplementedError):
+            dev.shoot(dng=True, stream=True)
+        assert dev.last_capture_chunks == 0
+
+    def test_a_timed_out_capture_reports_nothing(self, monkeypatch):
+        dev, session = self._device_with_a_real_protocol()
+        session.transaction.side_effect = [
+            ([7, 0], b""),
+            ([0x01], b""),
+            ([4, 0, 0xFFFFFFFF], b"JPEG"),
+            ([0], b""),
+        ]
+        assert dev.shoot(stream=True) == b"JPEG"
+        assert dev.last_capture_chunks == 1
+
+        # A camera that stays busy and never becomes ready.
+        session.transaction.side_effect = None
+        session.transaction.return_value = ([0], b"")
+        monkeypatch.setattr("pychdk.device.CAPTURE_INIT_GRACE", 0.0)
+        with pytest.raises(RuntimeError):
+            dev.shoot(stream=True)
+        assert dev.last_capture_chunks == 0
+
     def test_a_one_chunk_still_reports_one(self):
         dev, session = self._device_with_a_real_protocol()
         session.transaction.side_effect = [
