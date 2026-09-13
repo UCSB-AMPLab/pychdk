@@ -90,6 +90,11 @@ class PTPDevice:
         self._ep_out = None
         self._ep_int = None
         self._intf_num = None
+        # The interface we actually hold, set the moment the claim
+        # succeeds rather than when opening finishes. Everything
+        # between the claim and the end of open() can fail, and what
+        # is held has to be releasable in between.
+        self._claimed_intf = None
         self._is_open = False
 
     @property
@@ -154,6 +159,7 @@ class PTPDevice:
                 pass
 
         usb.util.claim_interface(self._dev, self._intf_num)
+        self._claimed_intf = self._intf_num
 
         # Find endpoints
         intf = cfg[(self._intf_num, 0)]
@@ -181,13 +187,22 @@ class PTPDevice:
         self._dev._finalize_called = True
 
     def close(self):
-        """Release the USB interface and dispose of device resources."""
-        if not self._is_open:
+        """Release whatever is held, however far open() got.
+
+        Opening claims the interface and then goes looking for
+        endpoints, so a device can own a claim while still failing to
+        open. Keying this on _is_open made close() a no-op in exactly
+        that case, and the claim was then held until the camera was
+        unplugged. It keys on the claim instead.
+        """
+        if self._claimed_intf is None and not self._is_open:
             return
-        try:
-            usb.util.release_interface(self._dev, self._intf_num)
-        except usb.core.USBError:
-            pass
+        if self._claimed_intf is not None:
+            try:
+                usb.util.release_interface(self._dev, self._claimed_intf)
+            except usb.core.USBError:
+                pass
+            self._claimed_intf = None
         try:
             usb.util.dispose_resources(self._dev)
         except usb.core.USBError:

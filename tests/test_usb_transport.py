@@ -55,6 +55,28 @@ def _make_mock_usb_device(vendor_id=0x04A9, product_id=0xABCD,
     return dev
 
 
+def _make_mock_usb_device_without_bulk_endpoints():
+    """A PTP interface that claims fine and then has nothing to talk on."""
+    ep_int = _make_mock_endpoint(0x83)
+    ep_int.bmAttributes = 0x03  # interrupt only
+
+    interface = MagicMock()
+    interface.bInterfaceClass = 6
+    interface.bInterfaceSubClass = 1
+    interface.bInterfaceProtocol = 1
+    interface.bInterfaceNumber = 0
+    interface.__iter__ = lambda self: iter([ep_int])
+
+    config = MagicMock()
+    config.__iter__ = lambda self: iter([interface])
+    config.__getitem__ = lambda self, key: interface
+
+    dev = MagicMock()
+    dev.__iter__ = lambda self: iter([config])
+    dev.__getitem__ = lambda self, i: config
+    return dev
+
+
 class TestFindPTPDevices:
     @patch("pychdk.usb_transport.usb.core.find")
     def test_finds_canon_ptp_devices(self, mock_find):
@@ -83,6 +105,39 @@ class TestPTPDevice:
         ptp.open()
         ptp.close()
         assert not ptp._is_open
+
+    @patch("pychdk.usb_transport.usb.util.release_interface")
+    @patch("pychdk.usb_transport.usb.util.claim_interface")
+    def test_a_claim_is_released_when_endpoint_discovery_fails(
+        self, mock_claim, mock_release,
+    ):
+        mock_dev = _make_mock_usb_device_without_bulk_endpoints()
+        ptp = PTPDevice(mock_dev)
+        with pytest.raises(RuntimeError, match="bulk endpoints"):
+            ptp.open()
+        # The interface was taken before discovery failed.
+        mock_claim.assert_called_once_with(mock_dev, 0)
+        ptp.close()
+        # So closing has to give it back, however far open() got.
+        mock_release.assert_called_once_with(mock_dev, 0)
+
+    @patch("pychdk.usb_transport.usb.util.release_interface")
+    def test_closing_a_device_that_never_opened_releases_nothing(
+        self, mock_release,
+    ):
+        ptp = PTPDevice(_make_mock_usb_device())
+        ptp.close()
+        mock_release.assert_not_called()
+
+    @patch("pychdk.usb_transport.usb.util.release_interface")
+    @patch("pychdk.usb_transport.usb.util.claim_interface")
+    def test_a_claim_is_given_back_only_once(self, mock_claim, mock_release):
+        mock_dev = _make_mock_usb_device()
+        ptp = PTPDevice(mock_dev)
+        ptp.open()
+        ptp.close()
+        ptp.close()
+        mock_release.assert_called_once_with(mock_dev, 0)
 
     def test_bulk_write(self):
         mock_dev = _make_mock_usb_device()

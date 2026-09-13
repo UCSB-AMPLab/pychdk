@@ -107,6 +107,21 @@ class TestConstructionIsExceptionSafe:
             transport.close.assert_called_once()
         assert len(_open_devices) == tracked_before
 
+    def test_a_failed_transport_open_is_also_released(self):
+        tracked_before = len(_open_devices)
+        with patch("pychdk.device.PTPDevice") as MockTransport, \
+             patch("pychdk.device.PTPSession"), \
+             patch("pychdk.device.ChdkPTP"):
+            # A transport that claims the interface and then fails
+            # finding endpoints raises out of open() itself.
+            MockTransport.return_value.open.side_effect = RuntimeError(
+                "Could not find bulk endpoints on PTP device",
+            )
+            with pytest.raises(RuntimeError, match="bulk endpoints"):
+                ChdkDevice(self._info(), _usb_device=MagicMock())
+            MockTransport.return_value.close.assert_called_once()
+        assert len(_open_devices) == tracked_before
+
     def test_a_failed_construction_tracks_nothing(self):
         tracked_before = len(_open_devices)
         with patch("pychdk.device.PTPDevice"), \

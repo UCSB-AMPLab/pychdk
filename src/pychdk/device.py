@@ -159,15 +159,16 @@ class ChdkDevice:
     def _open(self):
         """Claim the interface and open a session, or claim nothing.
 
-        The transport is claimed before the session can be opened, and
-        until the device is tracked there is nothing for the caller to
+        Until the device is tracked there is nothing for the caller to
         close: a constructor that raised here left the interface
         claimed with no object to release it, so a host retrying
         enumeration piled up claims on a port until the camera was
-        unplugged. Anything that fails past the claim gives it back.
+        unplugged. Anything that fails past the claim gives it back —
+        including a failure inside the transport's own open, which can
+        hold a claim and still raise.
         """
-        self._transport.open()
         try:
+            self._transport.open()
             self._session.open()
             self._connected = True
             _open_devices.add(self)
