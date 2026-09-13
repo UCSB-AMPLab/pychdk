@@ -141,6 +141,21 @@ class TestPTPDevice:
 
     @patch("pychdk.usb_transport.usb.util.release_interface")
     @patch("pychdk.usb_transport.usb.util.claim_interface")
+    def test_an_open_that_raises_holds_nothing(self, mock_claim, mock_release):
+        mock_dev = _make_mock_usb_device_without_bulk_endpoints()
+        ptp = PTPDevice(mock_dev)
+        with pytest.raises(RuntimeError, match="bulk endpoints"):
+            ptp.open()
+        # No caller did anything here: open() gave the claim back
+        # itself, so "open raised" means "nothing is held" without
+        # anyone having to remember a rollback.
+        mock_claim.assert_called_once_with(mock_dev, 0)
+        mock_release.assert_called_once_with(mock_dev, 0)
+        assert ptp._claimed_intf is None
+        assert not ptp._is_open
+
+    @patch("pychdk.usb_transport.usb.util.release_interface")
+    @patch("pychdk.usb_transport.usb.util.claim_interface")
     def test_a_failed_open_in_a_with_block_claims_nothing(
         self, mock_claim, mock_release,
     ):

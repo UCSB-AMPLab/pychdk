@@ -121,7 +121,15 @@ class PTPDevice:
             return None
 
     def open(self):
-        """Open the PTP device — claim interface and find endpoints."""
+        """Open the PTP device — claim interface and find endpoints.
+
+        Either this returns with the interface claimed, or it raises
+        having claimed nothing. That guarantee lives here rather than
+        in each caller because it was a convention before, and three
+        call sites independently failed to honour it: a claim taken
+        and then lost to an exception is held until the camera is
+        unplugged, and every caller had to remember that separately.
+        """
         if self._is_open:
             return
 
@@ -161,30 +169,42 @@ class PTPDevice:
         usb.util.claim_interface(self._dev, self._intf_num)
         self._claimed_intf = self._intf_num
 
-        # Find endpoints
-        intf = cfg[(self._intf_num, 0)]
-        for ep in intf:
-            attr = ep.bmAttributes & 0x03  # transfer type mask
-            direction = ep.bEndpointAddress & 0x80  # direction mask
-            if attr == usb.util.ENDPOINT_TYPE_BULK:
-                if direction == EP_DIR_IN:
-                    self._ep_in = ep
-                else:
-                    self._ep_out = ep
-            elif attr == usb.util.ENDPOINT_TYPE_INTR:
-                if direction == EP_DIR_IN:
-                    self._ep_int = ep
+        # Everything past the claim runs under the guarantee: if it
+        # raises, the interface goes back before the exception does.
+        try:
+            # Find endpoints
+            intf = cfg[(self._intf_num, 0)]
+            for ep in intf:
+                attr = ep.bmAttributes & 0x03  # transfer type mask
+                direction = ep.bEndpointAddress & 0x80  # direction mask
+                if attr == usb.util.ENDPOINT_TYPE_BULK:
+                    if direction == EP_DIR_IN:
+                        self._ep_in = ep
+                    else:
+                        self._ep_out = ep
+                elif attr == usb.util.ENDPOINT_TYPE_INTR:
+                    if direction == EP_DIR_IN:
+                        self._ep_int = ep
 
-        if self._ep_in is None or self._ep_out is None:
-            raise RuntimeError("Could not find bulk endpoints on PTP device")
+            if self._ep_in is None or self._ep_out is None:
+                raise RuntimeError(
+                    "Could not find bulk endpoints on PTP device"
+                )
 
-        self._is_open = True
+            self._is_open = True
 
-        # Disable pyusb's weakref.finalize cleanup for this Device.
-        # During Python shutdown, pyusb's finalizer can call libusb_open
-        # after the libusb context has been freed, causing a SIGSEGV.
-        # We handle all USB cleanup ourselves in close().
-        self._dev._finalize_called = True
+            # Disable pyusb's weakref.finalize cleanup for this Device.
+            # During Python shutdown, pyusb's finalizer can call
+            # libusb_open after the libusb context has been freed,
+            # causing a SIGSEGV. We handle all USB cleanup ourselves
+            # in close().
+            self._dev._finalize_called = True
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     def close(self):
         """Release whatever is held, however far open() got.
