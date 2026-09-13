@@ -194,6 +194,20 @@ class PTPDevice:
         open. Keying this on _is_open made close() a no-op in exactly
         that case, and the claim was then held until the camera was
         unplugged. It keys on the claim instead.
+
+        Repeated closes are safe in sequence, and two threads calling
+        close at once are safe as well, so there is no lock of our own
+        here. pyusb serialises claiming and releasing on a reentrant
+        lock it holds itself, and releases only an interface it still
+        records as claimed: in usb/core.py, _ResourceManager keeps a
+        threading.RLock, managed_claim_interface and
+        managed_release_interface are both decorated @synchronized
+        against it, and the release calls the backend only when the
+        interface is in its claimed set, removing it in a finally — so
+        a second release for the same interface does nothing, and a
+        repeated claim does not double-claim for the same reason.
+        Checked against the installed pyusb (1.3.1) rather than
+        assumed; worth a re-read if that version moves.
         """
         if self._claimed_intf is None and not self._is_open:
             return

@@ -479,7 +479,12 @@ class ChdkDevice:
         self._open()
 
     def close(self):
-        """Close the connection to the camera."""
+        """Close the connection to the camera.
+
+        Safe to call more than once, and safe against a concurrent
+        closer on the same device. PTPDevice.close says why, and where
+        in pyusb to check it.
+        """
         self._connected = False
         _open_devices.discard(self)
         try:

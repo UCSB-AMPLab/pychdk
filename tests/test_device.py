@@ -8,6 +8,7 @@ import pytest
 import pychdk
 from pychdk import device
 from pychdk.chdk import (
+    ChdkCommand,
     MessageType,
     REMOTE_CAP_NOTSET,
     ScriptDataType,
@@ -42,6 +43,27 @@ class TestListDevices:
     def test_empty_when_no_cameras(self, mock_find):
         mock_find.return_value = []
         assert list_devices() == []
+
+
+class _FakeClock:
+    """Stands in for the time module inside pychdk.device.
+
+    monotonic() walks a scripted sequence and then holds its last
+    value, so a thirty-second deadline can be reached in no time at
+    all; sleep() records what was asked for without waiting.
+    """
+
+    def __init__(self, readings):
+        self._readings = list(readings)
+        self.slept = 0.0
+
+    def monotonic(self):
+        if len(self._readings) > 1:
+            return self._readings.pop(0)
+        return self._readings[0]
+
+    def sleep(self, seconds):
+        self.slept += seconds
 
 
 class TestCaptureChunkCountThroughShoot:
@@ -108,7 +130,9 @@ class TestCaptureChunkCountThroughShoot:
             dev.shoot(dng=True, stream=True)
         assert dev.last_capture_chunks == 0
 
-    def test_a_timed_out_capture_reports_nothing(self, monkeypatch):
+    def test_a_second_capture_that_ends_without_data_reports_nothing(
+        self, monkeypatch,
+    ):
         dev, session = self._device_with_a_real_protocol()
         session.transaction.side_effect = [
             ([7, 0], b""),
@@ -119,13 +143,52 @@ class TestCaptureChunkCountThroughShoot:
         assert dev.shoot(stream=True) == b"JPEG"
         assert dev.last_capture_chunks == 1
 
-        # A camera that stays busy and never becomes ready.
+        # Nothing ready and the script already finished: this ends on
+        # the script-ended path, not at the deadline. See
+        # test_a_capture_that_runs_out_its_deadline_reports_nothing.
         session.transaction.side_effect = None
         session.transaction.return_value = ([0], b"")
         monkeypatch.setattr("pychdk.device.CAPTURE_INIT_GRACE", 0.0)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="without producing a capture"):
             dev.shoot(stream=True)
         assert dev.last_capture_chunks == 0
+
+    def test_a_capture_that_runs_out_its_deadline_reports_nothing(
+        self, monkeypatch,
+    ):
+        dev, session = self._device_with_a_real_protocol()
+        session.transaction.side_effect = [
+            ([7, 0], b""),
+            ([0x01], b""),
+            ([4, 0, 0xFFFFFFFF], b"JPEG"),
+            ([0], b""),
+        ]
+        assert dev.shoot(stream=True) == b"JPEG"
+        assert dev.last_capture_chunks == 1
+
+        # A camera that stays busy and never becomes ready. The clock is
+        # driven rather than waited on: the deadline is thirty seconds
+        # and the suite must not spend them.
+        def respond(operation, params=None, **kwargs):
+            command = params[0]
+            if command == ChdkCommand.EXECUTE_SCRIPT:
+                return ([8, 0], b"")
+            if command == ChdkCommand.REMOTE_CAPTURE_IS_READY:
+                return ([0], b"")       # never ready
+            if command == ChdkCommand.SCRIPT_STATUS:
+                return ([0b01], b"")    # still running, nothing to say
+            return ([0], b"")
+
+        session.transaction.side_effect = respond
+        clock = _FakeClock([0.0, 0.0, 0.0, 0.0, 999.0])
+        monkeypatch.setattr("pychdk.device.time", clock)
+
+        # TimeoutError, not RuntimeError: only the deadline raises this.
+        with pytest.raises(TimeoutError, match="did not complete"):
+            dev.shoot(stream=True)
+        assert dev.last_capture_chunks == 0
+        # It really went round the loop rather than falling straight out.
+        assert clock.slept > 0
 
     def test_a_one_chunk_still_reports_one(self):
         dev, session = self._device_with_a_real_protocol()
