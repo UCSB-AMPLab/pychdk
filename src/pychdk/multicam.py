@@ -12,13 +12,28 @@ class MultiCam:
     """Manages multiple CHDK cameras for coordinated capture."""
 
     def __init__(self):
+        """Open every camera found, or leave none of them open.
+
+        A camera that fails to open partway down the list leaves the
+        ones before it open and claimed, and the half-built MultiCam is
+        discarded, so nothing is left holding them: not the caller, who
+        never got an object, and not the cleanup registry, which tracks
+        devices weakly. They stay claimed until the process ends.
+
+        PTPDevice.open's guarantee does not reach this, because these
+        cameras opened successfully. They are orphans rather than
+        partial opens, so the rollback has to be here.
+        """
         devices = list_devices()
         if not devices:
             raise RuntimeError("No CHDK cameras found")
         self.cameras = []
-        for info in devices:
-            cam = ChdkDevice(info)
-            self.cameras.append(cam)
+        try:
+            for info in devices:
+                self.cameras.append(ChdkDevice(info))
+        except BaseException:
+            self.close()
+            raise
 
     def shoot(self, **kwargs):
         """Capture from all cameras concurrently.
