@@ -157,13 +157,31 @@ class ChdkDevice:
         self._open()
 
     def _open(self):
+        """Claim the interface and open a session, or claim nothing.
+
+        The transport is claimed before the session can be opened, and
+        until the device is tracked there is nothing for the caller to
+        close: a constructor that raised here left the interface
+        claimed with no object to release it, so a host retrying
+        enumeration piled up claims on a port until the camera was
+        unplugged. Anything that fails past the claim gives it back.
+        """
         self._transport.open()
-        self._session.open()
-        self._connected = True
-        _open_devices.add(self)
-        # Re-register so our cleanup runs before any pyusb finalizers
-        # that were registered during device creation (atexit is LIFO).
-        atexit.register(_cleanup_all)
+        try:
+            self._session.open()
+            self._connected = True
+            _open_devices.add(self)
+            # Re-register so our cleanup runs before any pyusb finalizers
+            # that were registered during device creation (atexit is LIFO).
+            atexit.register(_cleanup_all)
+        except BaseException:
+            self._connected = False
+            _open_devices.discard(self)
+            try:
+                self._transport.close()
+            except Exception:
+                pass
+            raise
 
     @property
     def is_connected(self):
@@ -431,10 +449,9 @@ class ChdkDevice:
         except Exception:
             pass
         time.sleep(wait)
-        self._transport.open()
-        self._session.open()
-        self._connected = True
-        _open_devices.add(self)
+        # Same claim, same rollback: a reopen that fails mid-session
+        # leaks exactly as a failed construction did.
+        self._open()
 
     def close(self):
         """Close the connection to the camera."""

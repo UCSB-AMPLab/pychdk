@@ -14,7 +14,12 @@ from pychdk.chdk import (
     ScriptErrorType,
     ScriptMessage,
 )
-from pychdk.device import ChdkDevice, list_devices, DeviceInfo
+from pychdk.device import (
+    ChdkDevice,
+    list_devices,
+    DeviceInfo,
+    _open_devices,
+)
 
 
 class TestListDevices:
@@ -37,6 +42,58 @@ class TestListDevices:
     def test_empty_when_no_cameras(self, mock_find):
         mock_find.return_value = []
         assert list_devices() == []
+
+
+class TestConstructionIsExceptionSafe:
+    """A claim taken during construction must not outlive the failure."""
+
+    def _info(self):
+        return DeviceInfo(
+            vendor_id=0x04A9, product_id=0x1234,
+            bus_num=1, device_num=5, serial_num="ABC",
+        )
+
+    def test_a_failed_session_releases_the_transport(self):
+        tracked_before = len(_open_devices)
+        with patch("pychdk.device.PTPDevice") as MockTransport, \
+             patch("pychdk.device.PTPSession") as MockSession, \
+             patch("pychdk.device.ChdkPTP"):
+            MockSession.return_value.open.side_effect = RuntimeError(
+                "session refused",
+            )
+            with pytest.raises(RuntimeError, match="session refused"):
+                ChdkDevice(self._info(), _usb_device=MagicMock())
+            transport = MockTransport.return_value
+            transport.open.assert_called_once()
+            # One open, one close: the claim does not survive the raise.
+            transport.close.assert_called_once()
+        assert len(_open_devices) == tracked_before
+
+    def test_a_failed_construction_tracks_nothing(self):
+        tracked_before = len(_open_devices)
+        with patch("pychdk.device.PTPDevice"), \
+             patch("pychdk.device.PTPSession") as MockSession, \
+             patch("pychdk.device.ChdkPTP"):
+            MockSession.return_value.open.side_effect = RuntimeError("nope")
+            with pytest.raises(RuntimeError):
+                ChdkDevice(self._info(), _usb_device=MagicMock())
+        # Nothing for _cleanup_all to find, and no half-built device.
+        assert len(_open_devices) == tracked_before
+
+    def test_a_failed_reconnect_also_releases_the_transport(self):
+        with patch("pychdk.device.PTPDevice") as MockTransport, \
+             patch("pychdk.device.PTPSession") as MockSession, \
+             patch("pychdk.device.ChdkPTP"):
+            dev = ChdkDevice(self._info(), _usb_device=MagicMock())
+            transport = MockTransport.return_value
+            transport.close.reset_mock()
+            MockSession.return_value.open.side_effect = RuntimeError("gone")
+            with pytest.raises(RuntimeError, match="gone"):
+                dev.reconnect(wait=0)
+            # Closed once on the way down, once releasing the failed open.
+            assert transport.close.call_count == 2
+            assert dev not in _open_devices
+            assert not dev.is_connected
 
 
 class TestChdkDevice:
