@@ -234,7 +234,23 @@ class PTPDevice:
         return bytes(self._ep_in.read(size, timeout=timeout))
 
     def __enter__(self):
-        self.open()
+        """Open on the way in, giving the claim back if opening fails.
+
+        Python does not call __exit__ when __enter__ raises, so nothing
+        outside the with block can release the interface: the rollback
+        has to be here. This is the third place the same fault turned
+        up — construction, reconnect, and now here — because open()
+        can claim and then raise, and every caller is left to remember
+        that separately.
+        """
+        try:
+            self.open()
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
         return self
 
     def __exit__(self, *args):

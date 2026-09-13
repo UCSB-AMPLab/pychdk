@@ -139,6 +139,22 @@ class TestPTPDevice:
         ptp.close()
         mock_release.assert_called_once_with(mock_dev, 0)
 
+    @patch("pychdk.usb_transport.usb.util.release_interface")
+    @patch("pychdk.usb_transport.usb.util.claim_interface")
+    def test_a_failed_open_in_a_with_block_claims_nothing(
+        self, mock_claim, mock_release,
+    ):
+        mock_dev = _make_mock_usb_device_without_bulk_endpoints()
+        ptp = PTPDevice(mock_dev)
+        # __exit__ never runs when __enter__ raises, so nothing outside
+        # the block can give the interface back.
+        with pytest.raises(RuntimeError, match="bulk endpoints"):
+            with ptp:
+                pass
+        mock_claim.assert_called_once_with(mock_dev, 0)
+        mock_release.assert_called_once_with(mock_dev, 0)
+        assert ptp._claimed_intf is None
+
     def test_bulk_write(self):
         mock_dev = _make_mock_usb_device()
         ptp = PTPDevice(mock_dev)
