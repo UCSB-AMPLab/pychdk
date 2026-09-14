@@ -156,7 +156,7 @@ tools/
 
 ## Known limitations
 
-- **Remote capture on A2500**: The A2500 CHDK port is alpha-level. Streaming remote capture (`shoot(stream=True)`) may fail with PTP error `0x2002`. The library falls back to SD card capture (`shoot()`) which triggers the shutter but stores images on the card rather than streaming them back.
+- **Remote capture on A2500**: The A2500 CHDK port is alpha-level. Streaming remote capture (`shoot(stream=True)`) may fail with PTP error `0x2002`, and nothing here falls back on its own: `shoot(stream=True)` raises, and a caller that wants the picture anyway has to call `shoot()` itself, which trips the shutter but leaves the image on the card rather than streaming it back. Whether the A2500 fails this way in practice has not been established against hardware.
 - **macOS only** for `tools/flash_chdk.py`. The library itself works on macOS and Linux.
 - **Canon cameras only** — CHDK is Canon-specific. Device discovery defaults to Canon's USB vendor ID (`0x04A9`).
 
