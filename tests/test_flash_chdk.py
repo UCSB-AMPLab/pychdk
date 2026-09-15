@@ -710,3 +710,128 @@ class TestOnlyAnInspectableLayoutMayBeErased:
         }))
         with pytest.raises(SystemExit):
             tool.read_existing_own_txt("/dev/disk4")
+
+
+def _answerer(answers):
+    """Stand in for input(), recording every prompt it is shown."""
+    remaining = list(answers)
+    prompts = []
+
+    def ask(prompt=""):
+        prompts.append(prompt)
+        if not remaining:
+            raise AssertionError(f"unexpected prompt: {prompt!r}")
+        return remaining.pop(0)
+
+    ask.prompts = prompts
+    return ask
+
+
+def _disks(count):
+    """`count` removable disks, as find_removable_disks reports them."""
+    return [
+        {
+            "disk": f"/dev/disk{4 + i}",
+            "name": f"Card {i}",
+            "size_gb": 15.9 + i,
+        }
+        for i in range(count)
+    ]
+
+
+class TestNoDiskIsErasedWithoutAConfirmation:
+    """The multi-disk path is where picking wrong is most likely.
+
+    It was also the only path that returned before the confirmation was
+    asked, so choosing from a list erased whatever was chosen. Every
+    path has to ask, and the question has to name the disk: the tool
+    accepts any physical removable medium, which on a Mac includes an
+    external USB drive that is not an SD card at all.
+    """
+
+    def test_choosing_from_several_disks_is_still_confirmed(self, monkeypatch):
+        tool = _load_tool()
+        ask = _answerer(["1", "y"])
+        monkeypatch.setattr("builtins.input", ask)
+        assert tool.pick_disk(_disks(3)) == "/dev/disk5"
+        assert any("ERASE" in p for p in ask.prompts)
+
+    def test_declining_after_choosing_from_several_disks_stops(
+        self, monkeypatch,
+    ):
+        tool = _load_tool()
+        monkeypatch.setattr("builtins.input", _answerer(["1", "n"]))
+        with pytest.raises(SystemExit) as excinfo:
+            tool.pick_disk(_disks(3))
+        assert excinfo.value.code == 0
+
+    def test_saying_nothing_after_choosing_from_several_disks_stops(
+        self, monkeypatch,
+    ):
+        tool = _load_tool()
+        monkeypatch.setattr("builtins.input", _answerer(["2", ""]))
+        with pytest.raises(SystemExit) as excinfo:
+            tool.pick_disk(_disks(3))
+        assert excinfo.value.code == 0
+
+    def test_the_multi_disk_prompt_names_the_disk_it_will_erase(
+        self, monkeypatch,
+    ):
+        tool = _load_tool()
+        ask = _answerer(["2", "y"])
+        monkeypatch.setattr("builtins.input", ask)
+        tool.pick_disk(_disks(3))
+        erase = [p for p in ask.prompts if "ERASE" in p]
+        assert erase, ask.prompts
+        assert "/dev/disk6" in erase[0]
+        assert "Card 2" in erase[0]
+        assert "17.9" in erase[0]
+
+    def test_the_single_disk_prompt_names_the_disk_it_will_erase(
+        self, monkeypatch,
+    ):
+        tool = _load_tool()
+        ask = _answerer(["y"])
+        monkeypatch.setattr("builtins.input", ask)
+        assert tool.pick_disk(_disks(1)) == "/dev/disk4"
+        erase = [p for p in ask.prompts if "ERASE" in p]
+        assert erase, ask.prompts
+        assert "/dev/disk4" in erase[0]
+        assert "Card 0" in erase[0]
+        assert "15.9" in erase[0]
+
+    def test_an_unreadable_choice_stops_before_the_confirmation(
+        self, monkeypatch,
+    ):
+        tool = _load_tool()
+        monkeypatch.setattr("builtins.input", _answerer(["banana"]))
+        with pytest.raises(SystemExit) as excinfo:
+            tool.pick_disk(_disks(3))
+        assert excinfo.value.code == 1
+
+    def test_a_negative_choice_is_not_quietly_counted_from_the_end(
+        self, monkeypatch,
+    ):
+        """A typed '-1' must not silently select a disk nobody named."""
+        tool = _load_tool()
+        monkeypatch.setattr("builtins.input", _answerer(["-1"]))
+        with pytest.raises(SystemExit) as excinfo:
+            tool.pick_disk(_disks(3))
+        assert excinfo.value.code == 1
+
+    def test_main_erases_nothing_when_the_confirmation_is_declined(
+        self, monkeypatch,
+    ):
+        tool = _load_tool()
+        formatted = []
+        monkeypatch.setattr(tool, "download_chdk", lambda: None)
+        monkeypatch.setattr(tool, "find_removable_disks", lambda: _disks(3))
+        monkeypatch.setattr("builtins.input", _answerer(["1", "n"]))
+        monkeypatch.setattr(tool, "_run", _fake_run(PARTITIONED_LAYOUT))
+        monkeypatch.setattr(
+            tool, "format_card", lambda disk: formatted.append(disk),
+        )
+        with pytest.raises(SystemExit) as excinfo:
+            tool.main()
+        assert excinfo.value.code == 0
+        assert formatted == []

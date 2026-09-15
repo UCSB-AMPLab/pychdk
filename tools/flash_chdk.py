@@ -80,31 +80,57 @@ def find_removable_disks() -> list[dict]:
     return disks
 
 
+def _describe(disk: dict) -> str:
+    """Name a disk the way the confirmation prompt has to name it."""
+    return f"{disk['disk']} ({disk['name']}, {disk['size_gb']}GB)"
+
+
 def pick_disk(disks: list[dict]) -> str:
-    """Let user pick a disk. Returns /dev/diskN path."""
+    """Let the operator pick a disk, and confirm before it is erased.
+
+    Selection and confirmation are separate steps, and the
+    confirmation happens on every path. The multi-disk path used to
+    return the chosen disk directly, so choosing from a list — the
+    case where picking the wrong one is most likely — was the one path
+    that erased without asking.
+
+    The prompt names the specific disk rather than saying "the disk",
+    because find_removable_disks accepts any physical removable medium.
+    On a Mac that includes an external USB drive that is not an SD card
+    at all, and the operator is the only check on that.
+
+    Returns:
+        The /dev/diskN path of the confirmed disk.
+    """
     if not disks:
         print("No removable disks found. Insert an SD card and try again.")
         sys.exit(1)
 
     if len(disks) == 1:
-        d = disks[0]
-        print(f"Found removable disk: {d['disk']} ({d['name']}, {d['size_gb']}GB)")
+        chosen = disks[0]
+        print(f"Found removable disk: {_describe(chosen)}")
     else:
         print("Found multiple removable disks:")
         for i, d in enumerate(disks):
-            print(f"  [{i}] {d['disk']} ({d['name']}, {d['size_gb']}GB)")
+            print(f"  [{i}] {_describe(d)}")
         choice = input("Which disk? ").strip()
         try:
-            return disks[int(choice)]["disk"]
+            index = int(choice)
+            if index < 0:
+                raise IndexError(index)
+            chosen = disks[index]
         except (ValueError, IndexError):
             print("Invalid choice.")
             sys.exit(1)
 
-    confirm = input("This will ERASE the disk. Continue? [y/N] ").strip().lower()
+    confirm = input(
+        f"This will ERASE {_describe(chosen)} and everything on it. "
+        "Continue? [y/N] "
+    ).strip().lower()
     if confirm != "y":
         print("Aborted.")
         sys.exit(0)
-    return disks[0]["disk"]
+    return chosen["disk"]
 
 
 def format_card(disk: str) -> str:
