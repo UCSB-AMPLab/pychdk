@@ -14,6 +14,7 @@ from pychdk.usb_transport import PTPDevice, find_ptp_devices, CANON_VENDOR_ID
 from pychdk.ptp import PTPSession, PTPError
 from pychdk.chdk import (
     ChdkPTP,
+    LV_TFR_VIEWPORT,
     MessageType,
     _script_error_name,
     REMOTE_CAP_JPEG,
@@ -210,21 +211,49 @@ class ChdkDevice:
 
         Waits for the switch_mode_usb script to finish, then polls
         get_mode() to confirm the physical switch completed.
+
+        The poll is Lua, and the two CHDK script languages disagree
+        about this call. CHDK's Lua get_mode() pushes three values —
+        is_record, is_video, mode — where is_record is
+        `!camera_info.state.mode_play`, so it is TRUE in record mode
+        (luaCB_get_mode, modules/luascript.c). CHDK's own wait idiom
+        relies on that polarity: the set_record documentation beside it
+        says to spin on `while not get_mode() do sleep(10) end` until
+        record mode arrives. uBASIC's get_mode is the other way round,
+        returning 0 for record, 1 for play and 2 for video record
+        (lib/ubasic/ubasic.c), and it is not what this call speaks.
+        ChdkPTP.execute_lua_wait returns the first RET value only, so
+        what lands in `current` is is_record.
+
+        A switch that is never confirmed raises rather than returning
+        quietly, so a wrong answer here cannot look like a right one.
+
+        This polarity is read from the CHDK sources named above. It has
+        not been checked against a camera.
+
+        Raises:
+            RuntimeError: If the camera never reports the requested
+                mode within the retries.
         """
-        mode_val = 1 if mode == "record" else 0
+        want_record = mode == "record"
+        mode_val = 1 if want_record else 0
         script_id = self._chdk.execute_script(f"switch_mode_usb({mode_val})")
         # Wait for the script to finish before polling, matching its id
         # so an error left by an earlier shot is not blamed on this.
         self._chdk.wait_for_script(timeout=5, script_id=script_id)
         # Give the camera time to physically switch (lens motor, etc.)
         time.sleep(1)
+        current = None
         for _ in range(8):
             current = self.lua_execute("return get_mode()")
-            # get_mode() returns 0 (falsy) for record, nonzero for play
-            in_record = not current
-            if (mode == "record" and in_record) or (mode == "play" and not in_record):
+            in_record = bool(current)
+            if in_record == want_record:
                 return
             time.sleep(0.5)
+        raise RuntimeError(
+            f"The camera did not switch to {mode} mode: get_mode() last "
+            f"reported is_record={current!r}"
+        )
 
     def lua_execute(self, lua_code, do_return=True, timeout=10.0):
         """Execute Lua code on the camera.
@@ -243,34 +272,40 @@ class ChdkDevice:
             self._chdk.execute_script(lua_code)
             return None
 
-    def shoot(self, shutter_speed=None, market_iso=None, dng=False,
-              stream=False, download_after=False, remove_after=False):
+    def shoot(self, shutter_speed=None, real_iso=None, dng=False,
+              stream=False):
         """Capture a photo.
 
         Args:
             shutter_speed: Shutter speed in seconds (e.g., 1/100).
-            market_iso: ISO value (e.g., 100, 200).
+            real_iso: REAL ISO sensitivity, not the number printed in
+                the camera's ISO menu. It is converted by iso_to_sv96
+                and sent to CHDK's set_sv96, both of which work in real
+                units; see iso_to_sv96 for why the two quantities are
+                not interchangeable and why this library will not
+                convert between them.
             dng: Request DNG. Not implemented on either path: streaming
                 refuses it, and the card path ignores it.
             stream: If True, use remote capture (direct USB transfer).
-            download_after: If True (and stream=False), download from SD card.
-            remove_after: If True, delete from SD card after download.
 
         Returns:
-            Image data as bytes when stream=True or download_after=True.
+            The JPEG as bytes when stream=True. Otherwise None: the
+            camera shoots to its own SD card and nothing is fetched
+            back, because this library has no path that fetches a card
+            image.
         """
         parts = []
         if shutter_speed is not None:
             tv96 = shutter_to_tv96(shutter_speed)
             parts.append(f"set_tv96_direct({tv96})")
-        if market_iso is not None:
-            sv96 = iso_to_sv96(market_iso)
+        if real_iso is not None:
+            sv96 = iso_to_sv96(real_iso)
             parts.append(f"set_sv96({sv96})")
 
         if stream:
             return self._shoot_streaming(parts, dng)
         else:
-            return self._shoot_standard(parts, download_after, remove_after)
+            return self._shoot_standard(parts)
 
     def _shoot_streaming(self, setup_parts, dng):
         """Capture using remote capture (PTP commands 13/14).
@@ -369,14 +404,21 @@ class ChdkDevice:
             # Checked after the queue, so a script that explained itself
             # is reported by its own words rather than by this status.
             # The two ways of getting here are different observations
-            # and read differently in a bench log: a script that ran and
-            # did not initialize, versus one still going after we gave
-            # up waiting. Neither proves the camera cannot do this.
+            # and read differently in a bench log: a script that ended
+            # with remote capture not initialized, versus one still
+            # going after we gave up waiting. Neither proves the camera
+            # cannot do this, and the first does not even prove
+            # init_usb_capture never ran — see
+            # ChdkPTP.remote_capture_is_ready for why.
             if status == REMOTE_CAP_NOTSET:
                 if not running:
                     raise RuntimeError(
-                        "The capture script ended without initializing "
-                        "remote capture"
+                        "The capture script ended and remote capture is "
+                        "not initialized: either init_usb_capture never "
+                        "ran, or it ran and the capture was cancelled "
+                        "afterwards — CHDK cancels on its own download "
+                        "timeout and on a transfer error, and reports "
+                        "both the same way as never having initialized"
                     )
                 if time.monotonic() >= init_deadline:
                     raise RuntimeError(
@@ -400,21 +442,24 @@ class ChdkDevice:
             pass
         return image
 
-    def _shoot_standard(self, setup_parts, download, remove):
-        """Capture to SD card, optionally download and delete."""
+    def _shoot_standard(self, setup_parts):
+        """Capture to the camera's SD card and leave it there.
+
+        Nothing comes back. Earlier versions took download_after and
+        remove_after options; neither was implemented — the download
+        listed A/DCIM, threw the listing away and returned None, and
+        the delete did nothing at all — so they were removed rather
+        than left as a promise. Whether the card path is ever needed is
+        a bench question, not one this library has answered.
+
+        Returns:
+            None.
+        """
         script = "; ".join(setup_parts + ["shoot()"])
         script_id = self._chdk.execute_script(script)
         # Wait for the shoot script to finish (shutter + SD write),
         # matching its id so a previous shot's error is not ours.
         self._chdk.wait_for_script(timeout=30, script_id=script_id)
-
-        if not download:
-            return None
-
-        # Find the most recent file — simplified approach
-        result = self.lua_execute(
-            "return os.listdir('A/DCIM')"
-        )
         return None
 
     def upload_file(self, local_path, remote_path):
@@ -439,15 +484,29 @@ class ChdkDevice:
         """
         return self._chdk.download_file(remote_path)
 
-    def get_frames(self):
+    def get_frames(self, flags=LV_TFR_VIEWPORT):
         """Generator yielding live preview frames.
 
+        The transfer flags are not optional. CHDK's live_view_get_data
+        adds each data block only if the matching LV_TFR_* bit was
+        asked for, so a request with no flag set returns the header and
+        the framebuffer descriptions and no pixels (core/live_view.c);
+        earlier versions of this generator sent none and could yield
+        frames with nothing in them. The default asks for the viewport,
+        which is the live image.
+
+        Args:
+            flags: Bitmask of LV_TFR_* values from pychdk.chdk.
+                Defaults to LV_TFR_VIEWPORT.
+
         Yields:
-            Raw frame data bytes.
+            Raw frame data bytes — CHDK's live view payload, which is
+            the header, the framebuffer descriptions and then whichever
+            blocks were requested. This library does not parse it.
         """
         while True:
             try:
-                data = self._chdk.get_display_data()
+                data = self._chdk.get_display_data(flags)
                 if data:
                     yield data
             except PTPError:
@@ -491,8 +550,17 @@ class ChdkDevice:
         two threads can both find the session open and both send one,
         because nothing here guards that. So a host that shares one
         device across threads has to serialise its own teardown.
-        Nothing in this library shares one: MultiCam gives each worker
-        its own device.
+
+        This library reaches that state on its own. MultiCam does give
+        each worker its own device, but the teardown path is shared:
+        _cleanup_all closes every open device from the main thread, and
+        it runs from the SIGINT/SIGTERM handler and from the atexit
+        hook. Either can close a device while a MultiCam worker is
+        inside shoot() on it. Nothing here currently serialises that,
+        and a plain lock is not an obvious fix, because close() runs
+        from a signal handler and at interpreter shutdown, where a lock
+        held by a thread being torn down would turn a clean exit into a
+        hang. It is an open design question, not a solved one.
         """
         self._connected = False
         _open_devices.discard(self)

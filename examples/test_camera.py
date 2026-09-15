@@ -57,8 +57,12 @@ def main():
     except Exception as e:
         print(f"Streaming capture failed: {e}")
         print("Trying non-streaming capture...")
-        cam.shoot(download_after=False)
-        print("Shot taken (saved to SD card)")
+        # This path waits for the shoot script to finish, so the script
+        # ran; it does not fetch anything back, and the library never
+        # checks that a file was written.
+        cam.shoot()
+        print("shoot() script finished; the image, if one was written, "
+              "is on the camera's card")
 
     cam.close()
     print("Done.")
