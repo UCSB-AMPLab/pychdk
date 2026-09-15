@@ -693,6 +693,9 @@ class TestSignalHandlers:
             device._original_sigterm = saved_originals[1]
 
 
+_UNSET = object()
+
+
 class _RecordPlayCamera:
     """A fake ChdkPTP that answers get_mode() the way CHDK's Lua does.
 
@@ -715,6 +718,11 @@ class _RecordPlayCamera:
         self.polls = 0
         self._obeys = obeys
         self.last_capture_chunks = 0
+        # Override what the poll answers, for the cases where the camera
+        # says something other than its state: `answer` pins every poll,
+        # `answers` is consumed one per poll and then falls back.
+        self.answer = _UNSET
+        self.answers = None
 
     def execute_script(self, script, *args, **kwargs):
         if self._obeys and script.startswith("switch_mode_usb("):
@@ -727,6 +735,10 @@ class _RecordPlayCamera:
     def execute_lua_wait(self, script, timeout=10.0):
         assert script == "return get_mode()", script
         self.polls += 1
+        if self.answers:
+            return self.answers.pop(0)
+        if self.answer is not _UNSET:
+            return self.answer
         return self.in_record
 
 
@@ -775,6 +787,31 @@ class TestSwitchModeConfirmsAgainstChdkLua:
         dev = self._device(fake, monkeypatch)
         with pytest.raises(RuntimeError, match="play"):
             dev.switch_mode("play")
+
+    def test_a_poll_with_no_answer_does_not_confirm_play(self, monkeypatch):
+        """Silence is not an answer of false.
+
+        execute_lua_wait returns None when a script ends without a RET
+        message, and bool(None) is False - so a poll that came back with
+        nothing at all used to satisfy a switch to play, because play is
+        the mode that expects a falsy is_record. A camera that never
+        answered would have been recorded as confirmed in playback.
+        """
+        fake = _RecordPlayCamera(in_record=True, obeys=False)
+        fake.answer = None
+        dev = self._device(fake, monkeypatch)
+        with pytest.raises(RuntimeError) as excinfo:
+            dev.switch_mode("play")
+        assert "None" in str(excinfo.value)
+        assert fake.polls > 1, "an unanswered poll was taken as an answer"
+
+    def test_a_poll_that_answers_after_silence_is_still_read(self, monkeypatch):
+        """Retrying a non-answer must not lose a real answer that follows."""
+        fake = _RecordPlayCamera(in_record=False)
+        fake.answers = [None, None, True]
+        dev = self._device(fake, monkeypatch)
+        dev.switch_mode("record")
+        assert fake.polls == 3
 
 
 class TestLivePreviewAsksForPixels:

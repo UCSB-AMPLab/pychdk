@@ -226,7 +226,9 @@ class ChdkDevice:
         what lands in `current` is is_record.
 
         A switch that is never confirmed raises rather than returning
-        quietly, so a wrong answer here cannot look like a right one.
+        quietly, so a wrong answer here cannot look like a right one. A
+        poll that comes back with no answer at all is not an answer
+        either: it is retried, not read as false.
 
         This polarity is read from the CHDK sources named above. It has
         not been checked against a camera.
@@ -246,6 +248,14 @@ class ChdkDevice:
         current = None
         for _ in range(8):
             current = self.lua_execute("return get_mode()")
+            if current is None:
+                # execute_lua_wait returns None when the script ends with
+                # no RET message, so this is the absence of an answer, not
+                # an answer of false. Reading it as false would confirm
+                # play mode on a camera that said nothing at all — and
+                # since bool(None) is False, a plain bool() here did.
+                time.sleep(0.5)
+                continue
             in_record = bool(current)
             if in_record == want_record:
                 return
@@ -291,8 +301,9 @@ class ChdkDevice:
         Returns:
             The JPEG as bytes when stream=True. Otherwise None: the
             camera shoots to its own SD card and nothing is fetched
-            back, because this library has no path that fetches a card
-            image.
+            back. download_file will fetch a file off the card by
+            path; what is missing is any way to learn the path the shot
+            just taken was written to.
         """
         parts = []
         if shutter_speed is not None:
@@ -449,8 +460,10 @@ class ChdkDevice:
         remove_after options; neither was implemented — the download
         listed A/DCIM, threw the listing away and returned None, and
         the delete did nothing at all — so they were removed rather
-        than left as a promise. Whether the card path is ever needed is
-        a bench question, not one this library has answered.
+        than left as a promise. download_file can fetch a card file by
+        path; the missing piece is discovering the path of the image
+        this call just took. Whether that is ever needed is a bench
+        question, not one this library has answered.
 
         Returns:
             None.
@@ -554,11 +567,22 @@ class ChdkDevice:
         This library reaches that state on its own. MultiCam does give
         each worker its own device, but the teardown path is shared:
         _cleanup_all closes every open device from the main thread, and
-        it runs from the SIGINT/SIGTERM handler and from the atexit
-        hook. Either can close a device while a MultiCam worker is
-        inside shoot() on it. Nothing here currently serialises that,
-        and a plain lock is not an obvious fix, because close() runs
-        from a signal handler and at interpreter shutdown, where a lock
+        it runs from the SIGINT/SIGTERM handler. That handler can close
+        a device while a MultiCam worker is inside shoot() on it, and
+        nothing here serialises the two.
+
+        The atexit hook is a different case, and the difference is
+        worth keeping straight: concurrent.futures registers its pool
+        shutdown through threading._register_atexit, which joins the
+        worker threads during threading._shutdown, and that runs before
+        atexit handlers do. So a MultiCam worker has already finished
+        by the time _cleanup_all runs at exit. A daemon thread of the
+        host's own is not joined that way and could still be inside
+        shoot() — but that is the host's thread, not one this library
+        started.
+
+        A plain lock is still not an obvious fix for the signal case,
+        because close() also runs at interpreter shutdown, where a lock
         held by a thread being torn down would turn a clean exit into a
         hang. It is an open design question, not a solved one.
         """

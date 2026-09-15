@@ -36,7 +36,13 @@ otherwise.
   the card path ever needs building is a bench decision.
 - **`ChdkDevice.switch_mode` now raises.** A switch that is never confirmed
   raises `RuntimeError` naming the mode asked for and what `get_mode()` last
-  reported, instead of returning exactly as a success did.
+  reported, instead of returning exactly as a success did. A poll that comes
+  back with *no* answer — `execute_lua_wait` returns `None` when a script ends
+  with no RET message — is now retried rather than read as a falsy
+  `is_record`. The first version of this fix used a plain `bool()`, and since
+  `bool(None)` is `False`, a camera that said nothing at all would have been
+  confirmed as being in play mode. Caught in the review of this release, not
+  on a camera.
 - **`util.iso_to_sv96`'s parameter is renamed** `iso` to `real_iso`. Only
   matters to a caller passing it by keyword.
 
@@ -69,10 +75,17 @@ otherwise.
 
 - **`close()` claimed nothing in the library shares a device.** It does.
   `_cleanup_all` closes every open device from the main thread, and it runs
-  from the SIGINT/SIGTERM handler and from the `atexit` hook — either can
-  close a device a `MultiCam` worker is inside `shoot()` on. The docstring now
-  says so. **No lock was added and the teardown path is unchanged**: a plain
-  lock is hazardous here, because `close()` runs from a signal handler and at
+  from the SIGINT/SIGTERM handler, which can close a device a `MultiCam`
+  worker is inside `shoot()` on. The `atexit` hook is *not* the same hazard:
+  `concurrent.futures` registers its pool shutdown through
+  `threading._register_atexit`, which joins the worker threads during
+  `threading._shutdown`, and that runs before `atexit` handlers — so a worker
+  has finished before `_cleanup_all` runs at exit. A daemon thread belonging
+  to the host is not joined that way, but that is the host's thread. The
+  docstring now draws that line.
+
+  **No lock was added and the teardown path is unchanged**: a plain lock is
+  hazardous here, because `close()` runs from a signal handler and at
   interpreter shutdown, where a lock held by a thread being torn down turns a
   clean exit into a hang. The design question is open.
 - **`drain_messages` said "drain all pending messages".** It reads at most
@@ -90,19 +103,30 @@ otherwise.
   least two reasons it cannot distinguish.
 - **`MultiCam.shoot`'s docstring promised "List of image data bytes (one per
   camera)".** With the card path that was a list of `None`s. It now states
-  what each path returns.
-- **README, A2500 remote capture.** The old sentence said the library "falls
-  back to SD card capture (`shoot()`) which triggers the shutter but stores
-  images on the card". It does not fall back, and a plain `shoot()` after a
-  streaming failure is not an established recovery path: `_shoot_streaming`
-  has already run `init_usb_capture`, so USB remote capture is still enabled
-  on the camera when the failure surfaces, and nobody has tested what an
-  ordinary shot does in that state. The README now says the failure mode and
-  says recovery is unestablished, rather than promising one.
+  what each path returns. The first rewrite then overshot in the other
+  direction, saying the library "has no path that fetches a card image":
+  `download_file` does exactly that, by path. What is missing is discovering
+  the path the shot just taken was written to, and that is what the docstrings
+  now say.
+- **README, A2500 remote capture — rewritten twice.** The old sentence said
+  the library "falls back to SD card capture (`shoot()`) which triggers the
+  shutter but stores images on the card". It does not fall back at all. The
+  replacement written for this release then claimed that `init_usb_capture`
+  had already run by the time the failure surfaced, so remote capture was
+  still enabled on the camera — which is itself more than the exception
+  establishes: the failure can come from the script submission, before
+  initialization ran at all, or from a capture that initialized and was then
+  cancelled on CHDK's own timeout. The README now says only what is
+  supported: there is no automatic fallback, and the exception establishes
+  neither what state the camera is in nor whether an ordinary `shoot()` would
+  recover the picture.
 - **README, "Check CHDK version".** `get_version()` returns the version of the
   CHDK **PTP protocol** the camera speaks (`PTP_CHDK_VERSION_MAJOR/MINOR`,
-  `core/ptp.h`), not the camera's firmware or the CHDK build on the card. The
-  library has no call that reports either. Relabelled.
+  `core/ptp.h`), not the camera's firmware or the CHDK build on the card.
+  There is no dedicated method for those, but the build is reachable through
+  CHDK's own Lua — `lua_execute("return get_buildinfo()")`, which
+  `examples/test_camera.py` already calls. Relabelled, and the README now
+  points at `get_buildinfo()` instead of saying no such call exists.
 - **`examples/test_two_cameras.py`** printed "Shots taken (saved to SD cards)"
   immediately after submitting a script with `do_return=False`, which it never
   waits on. It now prints what is actually known at that point.
@@ -132,3 +156,14 @@ coverage: the `switch_mode` polarity (written from CHDK's sources so that it
 fails under either inversion, not from what the implementation expects), the
 raise on an unconfirmed switch, the live-view transfer flags, the removed
 `shoot` keywords, and six cases around the flasher's confirmation prompt.
+
+## A note on how this release was reviewed
+
+Six further corrections in the lists above were found by adversarial review
+*after* the first pass was written and its tests were green — five of them
+sentences that still claimed more than the code or the cited source
+established, and one a real fault (`bool(None)`) introduced by the fix for
+the inverted polarity. That is the same failure mode this release exists to
+correct, reproduced inside the correction. The tests were green throughout.
+Prose has no tests; the only check on it is someone reading it against the
+source, twice.
