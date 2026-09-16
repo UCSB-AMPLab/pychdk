@@ -194,27 +194,39 @@ applies the value as given rather than snapping it (`core/shooting.c`).
 
 ## Tests
 
-`.venv/bin/python -m pytest tests/ -q` — 205 passed before, **229** after. New
+`.venv/bin/python -m pytest tests/ -q` — 205 passed before, **230** after. New
 coverage: the `switch_mode` polarity (written from CHDK's sources so that it
 fails under either inversion, not from what the implementation expects), the
 raise on an unconfirmed switch, the live-view transfer flags, the removed
-`shoot` keywords, and eight cases around the flasher's confirmation prompt.
+`shoot` keywords, and nine cases around the flasher's confirmation prompt — the last of which follows the chosen disk through `main()` to `format_card`, because a prompt naming one disk while another is returned would approve an erase nobody saw.
 
 ## Releasing this
 
-The order matters, and one step is a trap:
+The order matters, and two steps are traps:
 
-1. **Merge this branch.**
-2. **Tag `v0.1.3` on the merged tree — not on the `chore(release): 0.1.3`
+1. **Merge the backend's record-mode fix (NEH-251) first.** It is not a
+   dependency of this release in the packaging sense — the final `market_iso`
+   signature is compatible with the backend's existing call — but the backend
+   that exists before NEH-251 reads CHDK's `get_mode()` with uBASIC's polarity
+   and *rejects* a camera that reached record mode. Bumping the pin without it
+   ships a corrected library to a caller that will still refuse every body.
+2. **Merge this branch.**
+3. **Tag `v0.1.3` on the merged tree — not on the `chore(release): 0.1.3`
    commit.** That commit bumps the version while `shoot()` still took
    `real_iso`, a signature Captua does not call. Tagging it would publish a
    release that raises `TypeError` on the only consumer. Tag the final tree.
-3. **Bump the backend's pin in all three places together**: `requirements.txt`,
+4. **Bump the backend's pin in all three places together**: `requirements.txt`,
    `pixi.toml`, and `pixi.lock` (the git ref appears once per platform plus once
    in the package stanza, where the `version:` field also has to move). A
    requirements-only bump leaves the Pixi environment on 0.1.2, which is the
    environment the appliance actually runs.
-4. Only then release the backend.
+5. **In that same commit, update the backend's CHDK test fake.**
+   `tests/unit/chdk_fakes.py` models 0.1.2's `switch_mode`, which returns
+   whether or not the switch arrived; 0.1.3 raises. The change is not local to
+   the fake: the four polarity tests pass `stuck_in_play=True` and still call
+   through `switch_mode()`, so a raising fake stops them reaching the answer
+   they test. Fake and tests move with the pin.
+6. Only then release the backend.
 
 `pychdk`'s own dependencies are unchanged between 0.1.2 and 0.1.3 — `pyusb>=1.2.0`,
 `pytest>=7.0` for dev, `requires-python >=3.11` — so the lock edit is a ref and
@@ -246,3 +258,18 @@ was not set the wrong way without asserting that it was set at all.
 
 The reviewer with no shared context found more than the one that had been
 following along. That is worth remembering the next time a review looks clean.
+
+A second fresh-context pass then found nine more, and this time it mutated the
+code instead of reading it. Two tests turned out to pass with the behaviour
+they named removed — including the flasher's multi-disk test, which asserted
+that the confirmation prompt named the right disk while discarding the disk
+`pick_disk` actually returned. Change the return value and the prompt stays
+right and the test stays green: an erase of something the operator never saw,
+in the one part of this library that can destroy data. That test now asserts
+the return value, and a new one follows the chosen disk through `main()` to
+`format_card`.
+
+Three of the sentences it caught had been written during the previous round of
+fixing sentences. The lesson this release keeps teaching is not that prose is
+unreliable — it is that a claim about a test is as easy to get wrong as a claim
+about a camera, and only a mutation tells you which you have.

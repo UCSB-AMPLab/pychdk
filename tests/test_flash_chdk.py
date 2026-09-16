@@ -780,7 +780,11 @@ class TestNoDiskIsErasedWithoutAConfirmation:
         tool = _load_tool()
         ask = _answerer(["2", "y"])
         monkeypatch.setattr("builtins.input", ask)
-        tool.pick_disk(_disks(3))
+        # The returned disk is asserted, not just the prompt. A prompt that
+        # names one disk while the function returns another would approve an
+        # erase of something the operator never saw, and is the failure this
+        # whole class exists to prevent.
+        assert tool.pick_disk(_disks(3)) == "/dev/disk6"
         erase = [p for p in ask.prompts if "ERASE" in p]
         assert erase, ask.prompts
         assert "/dev/disk6" in erase[0]
@@ -835,3 +839,44 @@ class TestNoDiskIsErasedWithoutAConfirmation:
             tool.main()
         assert excinfo.value.code == 0
         assert formatted == []
+
+    def test_main_erases_exactly_the_disk_that_was_confirmed(
+        self, monkeypatch,
+    ):
+        """The confirmed disk and the erased disk have to be the same one.
+
+        pick_disk names a disk in its prompt and returns a disk, and nothing
+        downstream re-checks that those agree: format_card erases whatever it
+        is handed. So this follows the chosen disk all the way from the
+        selection to the erase, through main(), rather than stopping at the
+        prompt text.
+        """
+        tool = _load_tool()
+        formatted = []
+        monkeypatch.setattr(tool, "download_chdk", lambda: None)
+        monkeypatch.setattr(tool, "find_removable_disks", lambda: _disks(3))
+        ask = _answerer(["2", "y"])
+        monkeypatch.setattr("builtins.input", ask)
+        monkeypatch.setattr(tool, "_run", _fake_run(PARTITIONED_LAYOUT))
+        # The identity salvage and card classification are other tests'
+        # subject. Stubbed so the only thing this one can fail on is which
+        # disk reaches format_card.
+        monkeypatch.setattr(
+            tool, "read_existing_own_txt", lambda disk: (None, None),
+        )
+        monkeypatch.setattr(
+            tool, "format_card", lambda disk: formatted.append(disk) or "/Volumes/X",
+        )
+        monkeypatch.setattr(tool, "extract_chdk", lambda *a, **k: None)
+        monkeypatch.setattr(tool, "patch_boot_sector", lambda *a, **k: None)
+        monkeypatch.setattr(tool, "get_mount_point", lambda *a, **k: "/Volumes/X")
+        monkeypatch.setattr(tool, "write_camera_side", lambda *a, **k: None)
+        monkeypatch.setattr(tool, "eject_card", lambda *a, **k: None)
+        try:
+            tool.main()
+        except SystemExit as exc:
+            assert exc.code in (0, None), exc.code
+        erase = [p for p in ask.prompts if "ERASE" in p]
+        assert erase, ask.prompts
+        assert "/dev/disk6" in erase[0], erase[0]
+        assert formatted == ["/dev/disk6"], (formatted, erase)
