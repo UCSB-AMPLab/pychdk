@@ -19,21 +19,14 @@ Pre-1.0, with Captua as the only consumer. There is no compatibility shim and
 no deprecation period, and the version stays `0.1.3` rather than pretending
 otherwise.
 
-- **`ChdkDevice.shoot(market_iso=...)` is now `shoot(real_iso=...)`.** The
-  value was never treated as market ISO. `iso_to_sv96` computes
-  `96 * log2(ISO / 3.125)`, the APEX96 conversion for *real* sensitivity, and
-  `set_sv96` wants real sv96 as well. Market ISO — the number in the camera's
-  own ISO menu — is a different quantity, and the conversion between them is
-  per-camera, so this library does not do it. The parameter now says which one
-  it takes. **Callers must check whether the number they were passing was a
-  market number**; renaming the keyword makes the call fail loudly instead of
-  silently mis-exposing. Captua's `backend/capture/backends/chdk_backend.py`
-  passes `market_iso=` and will need updating with the pointer bump.
 - **`shoot(download_after=...)` and `shoot(remove_after=...)` are gone.**
   Neither was implemented: `download_after` listed `A/DCIM`, discarded the
   listing and returned `None`; `remove_after` did nothing at all. They were
   removed rather than implemented, so the documentation is true now. Whether
   the card path ever needs building is a bench decision.
+- **`util.iso_to_sv96`'s parameter is renamed** `iso` to `real_iso`, because
+  that is the quantity it takes. Only matters to a caller passing it by
+  keyword. `shoot()` no longer calls it at all — see "The ISO argument" below.
 - **`ChdkDevice.switch_mode` now raises.** A switch that is never confirmed
   raises `RuntimeError` naming the mode asked for and what `get_mode()` last
   reported, instead of returning exactly as a success did. A poll that comes
@@ -43,8 +36,11 @@ otherwise.
   `bool(None)` is `False`, a camera that said nothing at all would have been
   confirmed as being in play mode. Caught in the review of this release, not
   on a camera.
-- **`util.iso_to_sv96`'s parameter is renamed** `iso` to `real_iso`. Only
-  matters to a caller passing it by keyword.
+
+`shoot(market_iso=...)` **keeps its name and its callers.** An earlier draft of
+this release renamed it to `real_iso`, which would have broken Captua's only
+call site for no gain; the real fix turned out to be better than the rename.
+See "The ISO argument" below.
 
 ## Corrected behaviour
 
@@ -70,6 +66,43 @@ otherwise.
   `pychdk.chdk`. Captua was unaffected because it calls
   `get_display_data(LV_TFR_VIEWPORT)` directly rather than using this
   generator; that was luck.
+
+### The ISO argument
+
+`shoot(market_iso=...)` ran the number through `iso_to_sv96` and sent the
+result to `set_sv96`. Both of those work in **real** sensitivity, and the
+argument is the number in the camera's own ISO menu — a different quantity,
+related to real sensitivity by a per-camera offset (`SV96_MARKET_OFFSET`,
+defaulting to 69 sv96 units and overridable per platform, `core/shooting.c`).
+`shooting_sv96_market_to_real` subtracts that offset, so real sensitivity sits
+*below* the menu number: sending the menu number as though it were real made
+the camera about 0.7 of a stop **more** sensitive than the operator asked for
+(69 of the 96 sv96 units that make a stop), silently.
+
+The first draft of this release renamed the argument to `real_iso` and left
+the conversion alone, on the grounds that the code had never treated the value
+as a menu number. That was the wrong way round. Captua's UI offers
+`100, 200, 400, 800, 1600` — the camera's own ISO ladder, picked from a
+dropdown by an operator — and its `CameraConfig.iso` field is read back from
+the camera's own `iso` PTP widget on the DSLR path. The value is a menu
+number, and the library should take it as one.
+
+So `market_iso` keeps its name and now goes to CHDK's `set_iso_mode`, which
+for a value of 50 or more finds the nearest entry in the camera's `iso_table`
+and selects it (`shooting_set_iso_mode`, `core/shooting.c`). The camera's own
+table does the conversion; nothing is computed here, and the per-camera offset
+never touches our code. Captua's call site needs no change.
+
+One consequence to watch on the bench: `set_iso_mode` **snaps** to the nearest
+entry and reports nothing back, so a requested ISO and the one actually used
+can differ, and neither the library nor Captua will know. For every value our
+UI can send this is a no-op, since those values *are* the ladder — but B11a
+should log the requested ISO against what the camera reports afterwards, so we
+find out if that assumption is wrong on the A2500.
+
+The shutter path was checked for the same disease and does not have it: `tv96`
+is a single real quantity with no market variant, and `set_tv96_direct`
+applies the value as given rather than snapping it (`core/shooting.c`).
 
 ## Corrected claims
 

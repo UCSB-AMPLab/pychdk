@@ -849,7 +849,7 @@ class TestLivePreviewAsksForPixels:
         )
 
 
-class TestShootTakesRealIsoAndNothingItCannotDo:
+class TestShootTakesTheMenuIsoAndNothingItCannotDo:
     """The signature has to name the quantity, and drop the dead options."""
 
     def _make_device(self):
@@ -863,16 +863,35 @@ class TestShootTakesRealIsoAndNothingItCannotDo:
             dev = ChdkDevice(info, _usb_device=MagicMock())
             return dev, MockChdk.return_value
 
-    def test_real_iso_is_converted_with_the_apex_formula(self):
-        dev, mock_chdk = self._make_device()
-        dev.shoot(real_iso=100)
-        script = mock_chdk.execute_script.call_args.args[0]
-        assert f"set_sv96({iso_to_sv96(100)})" in script
+    def test_market_iso_goes_to_the_cameras_own_iso_table(self):
+        """The menu number goes to set_iso_mode, which owns the ladder.
 
-    def test_market_iso_is_gone(self):
+        set_iso_mode with a value of 50 or more picks the nearest entry
+        in the camera's iso_table (shooting_set_iso_mode,
+        core/shooting.c), so no conversion happens on this side.
+        """
+        dev, mock_chdk = self._make_device()
+        dev.shoot(market_iso=400)
+        script = mock_chdk.execute_script.call_args.args[0]
+        assert "set_iso_mode(400)" in script
+
+    def test_the_menu_number_is_not_sent_as_real_sensitivity(self):
+        """set_sv96 takes real sensitivity, which the menu number is not.
+
+        This is the fault the argument used to have: the menu number was
+        run through iso_to_sv96 and sent to set_sv96, silently setting a
+        different sensitivity from the one asked for.
+        """
+        dev, mock_chdk = self._make_device()
+        dev.shoot(market_iso=400)
+        script = mock_chdk.execute_script.call_args.args[0]
+        assert "set_sv96" not in script
+        assert str(iso_to_sv96(400)) not in script
+
+    def test_real_iso_is_gone(self):
         dev, _ = self._make_device()
         with pytest.raises(TypeError):
-            dev.shoot(market_iso=100)
+            dev.shoot(real_iso=100)
 
     def test_download_after_is_gone(self):
         dev, _ = self._make_device()

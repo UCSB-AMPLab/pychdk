@@ -22,7 +22,7 @@ from pychdk.chdk import (
     REMOTE_CAP_RAW,
     REMOTE_CAP_DNG_HDR,
 )
-from pychdk.util import shutter_to_tv96, iso_to_sv96
+from pychdk.util import shutter_to_tv96
 
 
 # How long a capture script is allowed to still be starting before an
@@ -282,18 +282,33 @@ class ChdkDevice:
             self._chdk.execute_script(lua_code)
             return None
 
-    def shoot(self, shutter_speed=None, real_iso=None, dng=False,
+    def shoot(self, shutter_speed=None, market_iso=None, dng=False,
               stream=False):
         """Capture a photo.
 
         Args:
             shutter_speed: Shutter speed in seconds (e.g., 1/100).
-            real_iso: REAL ISO sensitivity, not the number printed in
-                the camera's ISO menu. It is converted by iso_to_sv96
-                and sent to CHDK's set_sv96, both of which work in real
-                units; see iso_to_sv96 for why the two quantities are
-                not interchangeable and why this library will not
-                convert between them.
+                Converted to APEX96 and sent with set_tv96_direct,
+                which applies the value as given rather than snapping
+                it to one of the camera's own shutter speeds.
+            market_iso: ISO as it appears in the camera's own menu —
+                100, 200, 400 and so on. It goes to CHDK's
+                set_iso_mode, which for a value of 50 or more finds
+                the nearest entry in the camera's iso_table and
+                selects that (shooting_set_iso_mode, core/shooting.c).
+                So the camera's own table does the work and nothing is
+                converted here.
+
+                Two consequences worth knowing. A value off the ladder
+                is SNAPPED, not rejected: asking for 250 on a body
+                offering 200 and 400 gets one of those, and nothing
+                reports back which. And this is deliberately not the
+                set_sv96 path — that one takes real sensitivity, a
+                different quantity from the menu number, related to it
+                by a per-camera offset (see util.iso_to_sv96). Passing
+                a menu number as though it were real sensitivity is a
+                wrong exposure rather than an error, which is what this
+                argument used to do.
             dng: Request DNG. Not implemented on either path: streaming
                 refuses it, and the card path ignores it.
             stream: If True, use remote capture (direct USB transfer).
@@ -309,9 +324,8 @@ class ChdkDevice:
         if shutter_speed is not None:
             tv96 = shutter_to_tv96(shutter_speed)
             parts.append(f"set_tv96_direct({tv96})")
-        if real_iso is not None:
-            sv96 = iso_to_sv96(real_iso)
-            parts.append(f"set_sv96({sv96})")
+        if market_iso is not None:
+            parts.append(f"set_iso_mode({market_iso})")
 
         if stream:
             return self._shoot_streaming(parts, dng)

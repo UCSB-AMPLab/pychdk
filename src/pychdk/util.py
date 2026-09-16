@@ -46,7 +46,10 @@ def iso_to_sv96(real_iso):
     `#if !defined(SV96_MARKET_OFFSET)`, with the comment "Can be
     overriden in platform_camera.h (see IXUS700 for example)". This
     library does NOT convert between them: pass a real ISO, or convert
-    on the camera with CHDK's own functions before calling.
+    on the camera with CHDK's own functions before calling. That is what
+    ChdkDevice.shoot does — it takes the menu number and hands it to
+    set_iso_mode, letting the camera's own iso_table resolve it, and so
+    it does not call this function at all.
 
     Read from the CHDK sources named above. Not measured on a camera.
 
