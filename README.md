@@ -36,9 +36,13 @@ devices = pychdk.list_devices()
 # Connect to a camera
 cam = pychdk.ChdkDevice(devices[0])
 
-# Check CHDK version
+# Check which version of the CHDK PTP protocol the camera speaks.
+# This is the protocol version only — not the camera's firmware, and not
+# the CHDK build on the card. There is no dedicated method for those;
+# for the build, run CHDK's own Lua:
+#   cam.lua_execute("return get_buildinfo()")
 major, minor = cam._chdk.get_version()
-print(f"CHDK {major}.{minor}")
+print(f"CHDK PTP protocol {major}.{minor}")
 
 # Execute Lua on the camera
 result = cam.lua_execute("return 2 + 2")
@@ -156,7 +160,7 @@ tools/
 
 ## Known limitations
 
-- **Remote capture on A2500**: The A2500 CHDK port is alpha-level. Streaming remote capture (`shoot(stream=True)`) may fail with PTP error `0x2002`. The library falls back to SD card capture (`shoot()`) which triggers the shutter but stores images on the card rather than streaming them back.
+- **Remote capture on A2500 is unverified**: `tools/flash_chdk.py` installs CHDK 1.6.1 r6315 for A2500 firmware 1.00A, and this library's streaming remote capture has never been run against that camera. Earlier versions of this file called the port "alpha-level"; that is not supported by the build we install — `camera_list.csv` in release-1_6 carries a `BETA_STATUS` column, 34 of its 397 entries are marked `ALPHA` or `BETA`, and the A2500's entry (`a2500,100a,,,`) is not one of them. The same sentence reported a `0x2002` failure on this camera; we have no record of observing it, so treat that as a possibility to test rather than a known behaviour. What the code does establish is that if streaming does fail, the library does not fall back — the exception reaches the caller and nothing else is attempted. Nor does the exception tell you what state the camera is in: the failure can come from the script submission, before `init_usb_capture` has run at all, or from a capture that initialized and was then cancelled. So whether USB remote capture is still enabled afterwards, and whether an ordinary `shoot()` would recover the picture, are both unestablished. Recovery is an open question for the bench, not a documented workaround.
 - **macOS only** for `tools/flash_chdk.py`. The library itself works on macOS and Linux.
 - **Canon cameras only** — CHDK is Canon-specific. Device discovery defaults to Canon's USB vendor ID (`0x04A9`).
 

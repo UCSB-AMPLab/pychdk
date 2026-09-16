@@ -45,8 +45,13 @@ def main():
     except Exception as e:
         print(f"Streaming capture failed: {e}")
         print("Trying non-streaming capture...")
+        # do_return=False submits the script and does not wait on it,
+        # so at this point all that is known is that each camera was
+        # asked to shoot. Whether a shutter fired, and whether a file
+        # reached either card, is not known here.
         mc.execute_all("shoot()", do_return=False)
-        print("Shots taken (saved to SD cards)")
+        print("shoot() submitted to each camera; not waited on, so "
+              "whether a picture reached either card is unknown here")
 
     mc.close()
     print("Done.")

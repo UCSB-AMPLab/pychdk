@@ -1,7 +1,7 @@
 """Pure Python CHDK PTP camera control."""
 import importlib
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     "ChdkDevice", "list_devices", "DeviceInfo", "install_signal_handlers",

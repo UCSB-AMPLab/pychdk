@@ -23,9 +23,9 @@ A single-file Python CLI tool that downloads, formats, and flashes CHDK firmware
 
 ## Safety
 
-- Only lists removable, external disks — internal drives are filtered out via `diskutil info -plist` checking for `RemovableMedia` and `Internal` keys
-- Requires explicit `y` confirmation before formatting
-- If multiple removable disks are found, asks user to pick
+- Lists only whole disks that `diskutil info -plist` reports as `RemovableMedia` and `VirtualOrPhysical: Physical`, which excludes fixed drives, disk images and synthesised volumes. There is no `Internal` check, and none is wanted: a built-in SD slot is internal and is exactly what we want to flash from. The filter does not distinguish an SD card from any other removable medium, so an external USB drive can appear in the list — the confirmation prompt below, which names the disk, is the check on that
+- Requires explicit `y` confirmation before formatting, on every path
+- If multiple removable disks are found, asks user to pick — and then asks the same confirmation, naming the chosen disk. Selection is not consent
 - If no removable disks found, tells user to insert a card and exits
 
 ## Boot sector patching
@@ -54,8 +54,8 @@ Writes `ODD\n` or `EVEN\n` to `OWN.TXT` on the card root. This is how Captua ide
 $ python3 tools/flash_chdk.py
 
 Downloading CHDK 1.6.1-6315 for A2500... (cached at ~/.cache/pychdk/a2500-100a-1.6.1-6315-full.zip)
-Found removable disk: /dev/disk4 (SDCARD, 16GB, FAT32)
-This will ERASE /dev/disk4. Continue? [y/N] y
+Found removable disk: /dev/disk4 (SDCARD, 16.0GB)
+This will ERASE /dev/disk4 (SDCARD, 16.0GB) and everything on it. Continue? [y/N] y
 Formatting /dev/disk4 as FAT32...
 Extracting CHDK files to /Volumes/CHDK_A2500...
 Patching boot sector...

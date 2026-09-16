@@ -42,8 +42,14 @@ class MultiCam:
             **kwargs: Passed to each ChdkDevice.shoot().
 
         Returns:
-            List of image data bytes (one per camera), in the
-            same order as self.cameras.
+            One entry per camera, in the same order as self.cameras.
+            What the entries are depends on the path taken. With
+            stream=True each is the JPEG bytes that camera sent back.
+            Otherwise each camera shoots to its own SD card and every
+            entry is None — shoot() does not discover or return the saved
+            filenames. ChdkDevice.download_file fetches a card file by
+            path, and CHDK's own Lua can be asked where images go; neither
+            happens here.
         """
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=len(self.cameras)

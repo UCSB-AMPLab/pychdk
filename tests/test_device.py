@@ -1,6 +1,7 @@
 """Tests for high-level ChdkDevice API."""
 import importlib
 import signal
+import struct
 import sys
 import threading
 from unittest.mock import MagicMock, patch
@@ -9,6 +10,9 @@ import pychdk
 from pychdk import device
 from pychdk.chdk import (
     ChdkCommand,
+    LV_TFR_BITMAP,
+    LV_TFR_PALETTE,
+    LV_TFR_VIEWPORT,
     MessageType,
     REMOTE_CAP_NOTSET,
     ScriptDataType,
@@ -21,6 +25,8 @@ from pychdk.device import (
     DeviceInfo,
     _open_devices,
 )
+from pychdk.ptp import PTPError
+from pychdk.util import iso_to_sv96
 
 
 class TestListDevices:
@@ -337,9 +343,11 @@ class TestChdkDevice:
             ([MessageType.ERR, ScriptErrorType.RUN, 9, 12],
              b"stale error\x00"),    # from script 9, not ours
             ([0], b""),              # ours finished cleanly
-            ([0, 0], b""),           # get_mode() script starts
-            ([0], b""),              # drain: nothing pending
-            ([0], b""),              # not running, no messages
+            ([0], b""),              # drain before get_mode: nothing pending
+            ([31], b""),             # get_mode() script starts, id 31
+            ([0b11], b""),           # running, its answer waiting
+            ([MessageType.RET, ScriptDataType.BOOLEAN, 31, 4],
+             struct.pack("<I", 1)),  # is_record true: CHDK Lua for record
         ]
         dev.switch_mode("record")
 
@@ -472,15 +480,26 @@ class TestChdkDevice:
         mock_chdk.remote_capture_get_data.return_value = b"jpeg"
         assert dev.shoot(stream=True) == b"jpeg"
 
-    def test_a_script_that_ended_without_initializing_says_so(self):
+    def test_a_script_that_ended_uninitialized_names_both_causes(self):
+        """The status cannot tell "never ran" from "ran and was cancelled".
+
+        CHDK's set_remotecap_timeout documentation says that after a
+        timeout RemoteCaptureIsReady behaves as if remote capture were
+        never initialized (modules/luascript.c), so the message must
+        not claim the stronger of the two.
+        """
         dev, mock_chdk = self._make_device()
         mock_chdk.execute_script.return_value = 7
         mock_chdk.remote_capture_is_ready.return_value = (
             False, REMOTE_CAP_NOTSET,
         )
         mock_chdk.get_script_status.return_value = (False, False)
-        with pytest.raises(RuntimeError, match="ended without initializing"):
+        with pytest.raises(RuntimeError) as caught:
             dev.shoot(stream=True)
+        message = str(caught.value)
+        assert "not initialized" in message
+        assert "never ran" in message
+        assert "cancelled" in message
         assert mock_chdk.remote_capture_is_ready.call_count == 1
 
     def test_an_expired_grace_says_how_long_it_waited(self, monkeypatch):
@@ -672,3 +691,242 @@ class TestSignalHandlers:
             signal.signal(signal.SIGTERM, saved_handlers[1])
             device._original_sigint = saved_originals[0]
             device._original_sigterm = saved_originals[1]
+
+
+_UNSET = object()
+
+
+class _RecordPlayCamera:
+    """A fake ChdkPTP that answers get_mode() the way CHDK's Lua does.
+
+    CHDK's luaCB_get_mode pushes three values — is_record, is_video,
+    mode — and the first one is `!camera_info.state.mode_play`
+    (modules/luascript.c). So the value a Lua caller reads first is
+    is_record, and it is TRUE when the camera is in record mode.
+    uBASIC's get_mode is the other polarity entirely: 0 for record, 1
+    for play, 2 for video record (lib/ubasic/ubasic.c). ChdkDevice
+    polls in Lua, so this fake speaks Lua.
+
+    Written from the CHDK sources named above, not from a camera on a
+    bench. The point of writing it this way round is that a fake built
+    to agree with the implementation would pass under either polarity
+    and prove nothing about which one CHDK uses.
+    """
+
+    def __init__(self, in_record=False, obeys=True):
+        self.in_record = in_record
+        self.polls = 0
+        self._obeys = obeys
+        self.last_capture_chunks = 0
+        # Override what the poll answers, for the cases where the camera
+        # says something other than its state: `answer` pins every poll,
+        # `answers` is consumed one per poll and then falls back.
+        self.answer = _UNSET
+        self.answers = None
+
+    def execute_script(self, script, *args, **kwargs):
+        if self._obeys and script.startswith("switch_mode_usb("):
+            self.in_record = script == "switch_mode_usb(1)"
+        return 7
+
+    def wait_for_script(self, *args, **kwargs):
+        return None
+
+    def execute_lua_wait(self, script, timeout=10.0):
+        assert script == "return get_mode()", script
+        self.polls += 1
+        if self.answers:
+            return self.answers.pop(0)
+        if self.answer is not _UNSET:
+            return self.answer
+        return self.in_record
+
+
+class TestSwitchModeConfirmsAgainstChdkLua:
+    """The confirmation poll has to read CHDK's polarity, not uBASIC's."""
+
+    def _device(self, fake, monkeypatch):
+        monkeypatch.setattr(device, "time", _FakeClock([0.0]))
+        info = DeviceInfo(
+            vendor_id=0x04A9, product_id=0x1234,
+            bus_num=1, device_num=5, serial_num="ABC",
+        )
+        with patch("pychdk.device.PTPDevice"), \
+             patch("pychdk.device.PTPSession"), \
+             patch("pychdk.device.ChdkPTP", return_value=fake):
+            return ChdkDevice(info, _usb_device=MagicMock())
+
+    def test_record_is_confirmed_on_the_first_poll(self, monkeypatch):
+        """is_record TRUE means record, so one poll settles it."""
+        fake = _RecordPlayCamera(in_record=False)
+        dev = self._device(fake, monkeypatch)
+        dev.switch_mode("record")
+        assert fake.in_record is True
+        assert fake.polls == 1
+
+    def test_play_is_confirmed_on_the_first_poll(self, monkeypatch):
+        """is_record FALSE means play, so one poll settles that too."""
+        fake = _RecordPlayCamera(in_record=True)
+        dev = self._device(fake, monkeypatch)
+        dev.switch_mode("play")
+        assert fake.in_record is False
+        assert fake.polls == 1
+
+    def test_a_switch_the_camera_never_makes_raises(self, monkeypatch):
+        fake = _RecordPlayCamera(in_record=False, obeys=False)
+        dev = self._device(fake, monkeypatch)
+        with pytest.raises(RuntimeError) as excinfo:
+            dev.switch_mode("record")
+        message = str(excinfo.value)
+        assert "record" in message
+        assert "get_mode" in message
+        assert fake.polls > 1
+
+    def test_a_play_switch_the_camera_never_makes_raises(self, monkeypatch):
+        fake = _RecordPlayCamera(in_record=True, obeys=False)
+        dev = self._device(fake, monkeypatch)
+        with pytest.raises(RuntimeError, match="play"):
+            dev.switch_mode("play")
+
+    def test_a_poll_with_no_answer_does_not_confirm_play(self, monkeypatch):
+        """Silence is not an answer of false.
+
+        execute_lua_wait returns None when a script ends without a RET
+        message, and bool(None) is False - so a poll that came back with
+        nothing at all used to satisfy a switch to play, because play is
+        the mode that expects a falsy is_record. A camera that never
+        answered would have been recorded as confirmed in playback.
+        """
+        fake = _RecordPlayCamera(in_record=True, obeys=False)
+        fake.answer = None
+        dev = self._device(fake, monkeypatch)
+        with pytest.raises(RuntimeError) as excinfo:
+            dev.switch_mode("play")
+        assert "None" in str(excinfo.value)
+        assert fake.polls > 1, "an unanswered poll was taken as an answer"
+
+    def test_a_poll_that_answers_after_silence_is_still_read(self, monkeypatch):
+        """Retrying a non-answer must not lose a real answer that follows."""
+        fake = _RecordPlayCamera(in_record=False)
+        fake.answers = [None, None, True]
+        dev = self._device(fake, monkeypatch)
+        dev.switch_mode("record")
+        assert fake.polls == 3
+
+
+class TestLivePreviewAsksForPixels:
+    """GetDisplayData with no transfer flag sends no pixels at all."""
+
+    def _make_device(self):
+        info = DeviceInfo(
+            vendor_id=0x04A9, product_id=0x1234,
+            bus_num=1, device_num=5, serial_num="ABC",
+        )
+        with patch("pychdk.device.PTPDevice"), \
+             patch("pychdk.device.PTPSession"), \
+             patch("pychdk.device.ChdkPTP") as MockChdk:
+            dev = ChdkDevice(info, _usb_device=MagicMock())
+            return dev, MockChdk.return_value
+
+    def test_the_viewport_flag_is_the_value_chdk_defines(self):
+        """core/live_view.h: #define LV_TFR_VIEWPORT 0x01."""
+        assert LV_TFR_VIEWPORT == 0x01
+
+    def test_get_frames_asks_for_the_viewport(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.get_display_data.side_effect = [b"pixels", PTPError(0x2002)]
+        assert list(dev.get_frames()) == [b"pixels"]
+        assert mock_chdk.get_display_data.call_args_list[0].args == (
+            LV_TFR_VIEWPORT,
+        )
+
+    def test_a_caller_can_ask_for_something_else(self):
+        dev, mock_chdk = self._make_device()
+        mock_chdk.get_display_data.side_effect = [b"bm", PTPError(0x2002)]
+        list(dev.get_frames(flags=LV_TFR_BITMAP | LV_TFR_PALETTE))
+        assert mock_chdk.get_display_data.call_args_list[0].args == (
+            LV_TFR_BITMAP | LV_TFR_PALETTE,
+        )
+
+
+class TestShootTakesTheMenuIsoAndNothingItCannotDo:
+    """The signature has to name the quantity, and drop the dead options."""
+
+    def _make_device(self):
+        info = DeviceInfo(
+            vendor_id=0x04A9, product_id=0x1234,
+            bus_num=1, device_num=5, serial_num="ABC",
+        )
+        with patch("pychdk.device.PTPDevice"), \
+             patch("pychdk.device.PTPSession"), \
+             patch("pychdk.device.ChdkPTP") as MockChdk:
+            dev = ChdkDevice(info, _usb_device=MagicMock())
+            return dev, MockChdk.return_value
+
+    def test_the_menu_number_is_converted_on_the_camera(self):
+        """The whole market-to-real conversion happens in CHDK's own Lua.
+
+        iso_to_sv96 then sv96_market_to_real then set_sv96, each of them
+        CHDK's, so the per-camera SV96_MARKET_OFFSET is the camera's own
+        and nothing is computed on this side.
+        """
+        dev, mock_chdk = self._make_device()
+        dev.shoot(market_iso=400)
+        script = mock_chdk.execute_script.call_args.args[0]
+        assert "set_sv96(sv96_market_to_real(iso_to_sv96(400)))" in script
+
+    def test_the_iso_is_set_as_a_script_override_not_a_menu_write(self):
+        """set_sv96 outside a shot is what beats CHDK's own ISO override.
+
+        shooting_expo_param_override_thumb applies a script's deferred
+        photo_param_put_off.sv96 first and falls back to the camera's
+        configured ISO override only when none was set (core/shooting.c).
+        set_sv96 populates that deferred value; set_iso_mode does not, so
+        a card with ISO override enabled would silently win over the
+        caller. Emitting set_iso_mode here would be that regression.
+        """
+        dev, mock_chdk = self._make_device()
+        dev.shoot(market_iso=400)
+        script = mock_chdk.execute_script.call_args.args[0]
+        # Both halves are needed. Without the first this passes when the
+        # ISO is not set at all, which is the other way to get it wrong.
+        assert "set_sv96(" in script
+        assert "set_iso_mode" not in script
+
+    def test_the_menu_number_is_not_sent_as_real_sensitivity(self):
+        """The market-to-real step is not optional.
+
+        This is the fault the argument used to have: the menu number was
+        run through iso_to_sv96 and handed straight to set_sv96, which
+        takes real sensitivity, so the override requested sat about 0.72 of
+        a stop above the corrected one on a platform using the default
+        69-unit offset. The conversion has to be in the script.
+        """
+        dev, mock_chdk = self._make_device()
+        dev.shoot(market_iso=400)
+        script = mock_chdk.execute_script.call_args.args[0]
+        assert "sv96_market_to_real" in script
+        assert f"set_sv96({iso_to_sv96(400)})" not in script
+
+    def test_real_iso_is_gone(self):
+        dev, _ = self._make_device()
+        with pytest.raises(TypeError):
+            dev.shoot(real_iso=100)
+
+    def test_download_after_is_gone(self):
+        dev, _ = self._make_device()
+        with pytest.raises(TypeError):
+            dev.shoot(download_after=True)
+
+    def test_remove_after_is_gone(self):
+        dev, _ = self._make_device()
+        with pytest.raises(TypeError):
+            dev.shoot(remove_after=True)
+
+    def test_the_card_path_returns_nothing_and_lists_nothing(self):
+        dev, mock_chdk = self._make_device()
+        assert dev.shoot() is None
+        scripts = [
+            call.args[0] for call in mock_chdk.execute_script.call_args_list
+        ]
+        assert not any("os.listdir" in s for s in scripts)

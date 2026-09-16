@@ -69,6 +69,22 @@ class ScriptFlag(IntEnum):
     FLUSH = 0x200
 
 
+# Live view transfer flags: which block(s) GetDisplayData should send.
+# These are the LV_TFR_* values in CHDK's core/live_view.h. They matter
+# because they are not optional: live_view_get_data tests each flag
+# before it adds the matching block, so a request with no flag set
+# comes back as the header and the framebuffer descriptions and no
+# pixel data at all (core/live_view.c). CHDK's own protocol note says
+# as much — "The frame buffer descriptions are returned regardless of
+# whether the data is available" (core/live_view.h).
+#
+# Read from the CHDK sources named above, not confirmed against a
+# camera.
+LV_TFR_VIEWPORT = 0x01
+LV_TFR_BITMAP = 0x04
+LV_TFR_PALETTE = 0x08
+LV_TFR_BITMAP_OPACITY = 0x10
+
 # Remote capture format bits
 REMOTE_CAP_JPEG = 0x01
 REMOTE_CAP_RAW = 0x02
@@ -360,8 +376,23 @@ class ChdkPTP:
         poll can arrive before init_usb_capture has executed and get
         this answer perfectly legitimately. It is a failure only once
         the script has had its chance — which the caller knows and this
-        method does not. A caller seeing it after the script has ended
-        is looking at an initialization that never happened.
+        method does not.
+
+        Even then it establishes less than it looks like it does. All a
+        caller seeing it after the script has ended knows is that
+        remote capture is not initialized NOW, and there are at least
+        two ways to arrive there that this status does not separate:
+        init_usb_capture never ran, or it ran and the capture was
+        cancelled afterwards. CHDK clears the capture target after its
+        own download timeout — the set_remotecap_timeout documentation
+        says "following a timeout, RemoteCaptureIsReady and
+        RemoteCaptureGetData will behave as if remote capture were not
+        initialized" (modules/luascript.c) — and after certain
+        chunk-selection errors, both by way of remotecap_reset
+        (core/remotecap.c). A host-side transfer failure on its own
+        does not establish that the reset happened: the PTP handler
+        does not check what send_data returned (core/ptp.c). So read
+        this as "not initialized", not as "never initialized".
 
         Returns:
             Tuple of (is_ready, status). status is REMOTE_CAP_NOTSET
@@ -498,7 +529,13 @@ class ChdkPTP:
         raise TimeoutError(f"Script still running after {timeout}s")
 
     def drain_messages(self):
-        """Drain all pending messages from the script message queue."""
+        """Read up to fifty pending messages off the script queue.
+
+        A bounded attempt, not a guarantee. It stops early when the
+        camera reports the queue empty, and stops regardless at fifty.
+        It returns nothing either way, so a caller cannot tell which of
+        the two happened and must not assume the queue is now empty.
+        """
         for _ in range(50):
             _, has_msgs = self.get_script_status()
             if not has_msgs:

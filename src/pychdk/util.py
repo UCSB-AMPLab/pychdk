@@ -21,18 +21,49 @@ def shutter_to_tv96(shutter_speed):
     return round(-96 * math.log2(shutter_speed))
 
 
-def iso_to_sv96(iso):
-    """Convert ISO value to SV96 (APEX96 sensitivity value).
+def iso_to_sv96(real_iso):
+    """Convert REAL ISO sensitivity to SV96 (APEX96 sensitivity value).
 
-    Formula: SV96 = 96 * log2(ISO / 3.125)
+    Formula: SV96 = 96 * log2(real_iso / 3.125)
+
+    This is the APEX96 conversion for real sensitivity, and it is the
+    same arithmetic CHDK does: shooting_get_sv96_from_iso computes
+    log2(iso * 32 / 100) * 96 (core/shooting.c), which is the identical
+    quantity written with 32/100 instead of 1/3.125, and that function
+    is what CHDK's own Lua iso_to_sv96 calls (modules/luascript.c). The
+    result is what set_sv96 wants: Lua set_sv96 goes to
+    shooting_set_sv96, and its counterpart get_sv96 reads
+    shooting_get_sv96_real (core/shooting.c) — both in real units.
+
+    This is arithmetic, not a market-to-real conversion. Feed it a
+    market ISO — the number in the camera's own ISO menu — and you get
+    the sv96 for that number; the mistake is then treating that result
+    as a real sv96, which is what set_sv96 takes.
+
+    CHDK keeps the two quantities apart deliberately: it stores them in
+    separate properties (PROPCASE_SV for real, PROPCASE_SV_MARKET for
+    market) and exposes iso_market_to_real, iso_real_to_market,
+    sv96_market_to_real and sv96_real_to_market to move between them.
+    The offset is per-camera and is not one number: core/shooting.c
+    defaults SV96_MARKET_OFFSET to 69 sv96 units under
+    `#if !defined(SV96_MARKET_OFFSET)`, with the comment "Can be
+    overriden in platform_camera.h (see IXUS700 for example)" — and the
+    IXUS700 platform does override it, to 20.
+
+    So this library does not convert between them. Before handing this
+    result to set_sv96, a market number needs the camera's own
+    market-to-real step. ChdkDevice.shoot does that on the camera and
+    therefore does not call this function at all; see its docstring.
+
+    Read from the CHDK sources named above. Not measured on a camera.
 
     Args:
-        iso: ISO sensitivity (e.g., 100, 200, 400).
+        real_iso: Real ISO sensitivity (e.g., 100, 200, 400).
 
     Returns:
         Integer SV96 value.
     """
-    return round(96 * math.log2(iso / 3.125))
+    return round(96 * math.log2(real_iso / 3.125))
 
 
 def aperture_to_av96(aperture):
