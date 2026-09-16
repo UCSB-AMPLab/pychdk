@@ -46,9 +46,10 @@ class MultiCam:
             What the entries are depends on the path taken. With
             stream=True each is the JPEG bytes that camera sent back.
             Otherwise each camera shoots to its own SD card and every
-            entry is None — nothing is downloaded. ChdkDevice.download_file
-            will fetch a card file by path; what is missing is any way to
-            learn the paths the shots just taken were written to.
+            entry is None — shoot() does not discover or return the saved
+            filenames. ChdkDevice.download_file fetches a card file by
+            path, and CHDK's own Lua can be asked where images go; neither
+            happens here.
         """
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=len(self.cameras)

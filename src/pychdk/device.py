@@ -292,23 +292,40 @@ class ChdkDevice:
                 which applies the value as given rather than snapping
                 it to one of the camera's own shutter speeds.
             market_iso: ISO as it appears in the camera's own menu —
-                100, 200, 400 and so on. It goes to CHDK's
-                set_iso_mode, which for a value of 50 or more finds
-                the nearest entry in the camera's iso_table and
-                selects that (shooting_set_iso_mode, core/shooting.c).
-                So the camera's own table does the work and nothing is
-                converted here.
+                100, 200, 400 and so on. It is converted to a real
+                sensitivity ON THE CAMERA and applied as a script
+                exposure override:
 
-                Two consequences worth knowing. A value off the ladder
-                is SNAPPED, not rejected: asking for 250 on a body
-                offering 200 and 400 gets one of those, and nothing
-                reports back which. And this is deliberately not the
-                set_sv96 path — that one takes real sensitivity, a
-                different quantity from the menu number, related to it
-                by a per-camera offset (see util.iso_to_sv96). Passing
-                a menu number as though it were real sensitivity is a
-                wrong exposure rather than an error, which is what this
-                argument used to do.
+                    set_sv96(sv96_market_to_real(iso_to_sv96(N)))
+
+                Each step is CHDK's own. iso_to_sv96 is the APEX96
+                conversion, whose source comment reads "equivalent to
+                (short)(log2(iso/3.125)*96+0.5) [APEX equation]";
+                sv96_market_to_real subtracts SV96_MARKET_OFFSET, which
+                is per-camera and overridable in platform_camera.h; and
+                set_sv96 takes the real value. Nothing is converted
+                here, and the offset never touches this library.
+
+                Two things make this the right call rather than
+                set_iso_mode, which also takes a menu number:
+
+                First, priority. At capture CHDK applies a script's
+                deferred sv96 first and falls back to its own
+                configured ISO override only if none was set
+                (shooting_expo_param_override_thumb, core/shooting.c).
+                set_sv96 outside a shot populates that deferred value
+                (photo_param_put_off.sv96); set_iso_mode does not. On a
+                card with CHDK's ISO override enabled, set_iso_mode
+                would be silently overridden and the caller's ISO lost.
+
+                Second, exactness. set_iso_mode snaps to the nearest
+                entry in the camera's iso_table; this path applies the
+                value asked for.
+
+                Passing a menu number straight to set_sv96 as though it
+                were already real — which this argument used to do —
+                makes the camera about 0.7 of a stop more sensitive
+                than asked, silently.
             dng: Request DNG. Not implemented on either path: streaming
                 refuses it, and the card path ignores it.
             stream: If True, use remote capture (direct USB transfer).
@@ -316,16 +333,23 @@ class ChdkDevice:
         Returns:
             The JPEG as bytes when stream=True. Otherwise None: the
             camera shoots to its own SD card and nothing is fetched
-            back. download_file will fetch a file off the card by
-            path; what is missing is any way to learn the path the shot
-            just taken was written to.
+            back: shoot() does not discover or return the saved
+            filename. download_file fetches a card file by path, and
+            CHDK's own Lua (get_image_dir, the exposure counter, a
+            directory listing) can be used to find one — none of that
+            happens here.
         """
         parts = []
         if shutter_speed is not None:
             tv96 = shutter_to_tv96(shutter_speed)
             parts.append(f"set_tv96_direct({tv96})")
         if market_iso is not None:
-            parts.append(f"set_iso_mode({market_iso})")
+            # Converted on the camera, so the per-camera market-to-real
+            # offset is the camera's own. See shoot() for why this is
+            # set_sv96 rather than set_iso_mode.
+            parts.append(
+                f"set_sv96(sv96_market_to_real(iso_to_sv96({market_iso})))"
+            )
 
         if stream:
             return self._shoot_streaming(parts, dng)
@@ -474,10 +498,11 @@ class ChdkDevice:
         remove_after options; neither was implemented — the download
         listed A/DCIM, threw the listing away and returned None, and
         the delete did nothing at all — so they were removed rather
-        than left as a promise. download_file can fetch a card file by
-        path; the missing piece is discovering the path of the image
-        this call just took. Whether that is ever needed is a bench
-        question, not one this library has answered.
+        than left as a promise. What is missing is narrow: this method
+        does not discover or return the saved filename. download_file
+        fetches a card file by path, and CHDK's Lua can be asked where
+        images go. Whether shoot() should do that for the caller is a
+        bench question, not one this library has answered.
 
         Returns:
             None.

@@ -87,18 +87,24 @@ dropdown by an operator — and its `CameraConfig.iso` field is read back from
 the camera's own `iso` PTP widget on the DSLR path. The value is a menu
 number, and the library should take it as one.
 
-So `market_iso` keeps its name and now goes to CHDK's `set_iso_mode`, which
-for a value of 50 or more finds the nearest entry in the camera's `iso_table`
-and selects it (`shooting_set_iso_mode`, `core/shooting.c`). The camera's own
-table does the conversion; nothing is computed here, and the per-camera offset
-never touches our code. Captua's call site needs no change.
+So `market_iso` keeps its name, and the conversion moves **onto the camera**:
 
-One consequence to watch on the bench: `set_iso_mode` **snaps** to the nearest
-entry and reports nothing back, so a requested ISO and the one actually used
-can differ, and neither the library nor Captua will know. For every value our
-UI can send this is a no-op, since those values *are* the ladder — but B11a
-should log the requested ISO against what the camera reports afterwards, so we
-find out if that assumption is wrong on the A2500.
+    set_sv96(sv96_market_to_real(iso_to_sv96(N)))
+
+Every step is CHDK's own, so the per-camera offset never touches our code and
+nothing is computed here. Captua's call site needs no change.
+
+A second draft used `set_iso_mode(N)`, which also takes a menu number and lets
+the camera's `iso_table` resolve it. **That was wrong, and adversarial review
+caught it.** At capture, CHDK applies a script's deferred sv96 first and falls
+back to the camera's *own configured* ISO override only when none was set
+(`shooting_expo_param_override_thumb`, `core/shooting.c:1922-1928`).
+`set_sv96` outside a shot populates that deferred value
+(`photo_param_put_off.sv96`, `:558`); `set_iso_mode` does not. So on a card
+with CHDK's ISO override enabled, `set_iso_mode` would have been silently
+beaten and the operator's ISO lost. The chain above keeps script priority
+*and* converts honestly. It is also exact, where `set_iso_mode` snaps to the
+nearest ladder entry.
 
 The shutter path was checked for the same disease and does not have it: `tv96`
 is a single real quantity with no market variant, and `set_tv96_direct`
@@ -138,9 +144,10 @@ applies the value as given rather than snapping it (`core/shooting.c`).
   camera)".** With the card path that was a list of `None`s. It now states
   what each path returns. The first rewrite then overshot in the other
   direction, saying the library "has no path that fetches a card image":
-  `download_file` does exactly that, by path. What is missing is discovering
-  the path the shot just taken was written to, and that is what the docstrings
-  now say.
+  `download_file` does exactly that, by path. The narrow true claim, which the
+  docstrings now make, is that **`shoot()` does not discover or return the
+  saved filename** — CHDK's Lua can be asked where images go, and this library
+  simply does not ask.
 - **README, A2500 remote capture — rewritten twice.** The old sentence said
   the library "falls back to SD card capture (`shoot()`) which triggers the
   shutter but stores images on the card". It does not fall back at all. The

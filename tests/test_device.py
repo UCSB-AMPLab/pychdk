@@ -863,30 +863,46 @@ class TestShootTakesTheMenuIsoAndNothingItCannotDo:
             dev = ChdkDevice(info, _usb_device=MagicMock())
             return dev, MockChdk.return_value
 
-    def test_market_iso_goes_to_the_cameras_own_iso_table(self):
-        """The menu number goes to set_iso_mode, which owns the ladder.
+    def test_the_menu_number_is_converted_on_the_camera(self):
+        """The whole market-to-real conversion happens in CHDK's own Lua.
 
-        set_iso_mode with a value of 50 or more picks the nearest entry
-        in the camera's iso_table (shooting_set_iso_mode,
-        core/shooting.c), so no conversion happens on this side.
+        iso_to_sv96 then sv96_market_to_real then set_sv96, each of them
+        CHDK's, so the per-camera SV96_MARKET_OFFSET is the camera's own
+        and nothing is computed on this side.
         """
         dev, mock_chdk = self._make_device()
         dev.shoot(market_iso=400)
         script = mock_chdk.execute_script.call_args.args[0]
-        assert "set_iso_mode(400)" in script
+        assert "set_sv96(sv96_market_to_real(iso_to_sv96(400)))" in script
+
+    def test_the_iso_is_set_as_a_script_override_not_a_menu_write(self):
+        """set_sv96 outside a shot is what beats CHDK's own ISO override.
+
+        shooting_expo_param_override_thumb applies a script's deferred
+        photo_param_put_off.sv96 first and falls back to the camera's
+        configured ISO override only when none was set (core/shooting.c).
+        set_sv96 populates that deferred value; set_iso_mode does not, so
+        a card with ISO override enabled would silently win over the
+        caller. Emitting set_iso_mode here would be that regression.
+        """
+        dev, mock_chdk = self._make_device()
+        dev.shoot(market_iso=400)
+        script = mock_chdk.execute_script.call_args.args[0]
+        assert "set_iso_mode" not in script
 
     def test_the_menu_number_is_not_sent_as_real_sensitivity(self):
-        """set_sv96 takes real sensitivity, which the menu number is not.
+        """The market-to-real step is not optional.
 
         This is the fault the argument used to have: the menu number was
-        run through iso_to_sv96 and sent to set_sv96, silently setting a
-        different sensitivity from the one asked for.
+        run through iso_to_sv96 and handed straight to set_sv96, which
+        takes real sensitivity — about 0.7 of a stop more sensitive than
+        asked, silently. The conversion has to be in the script.
         """
         dev, mock_chdk = self._make_device()
         dev.shoot(market_iso=400)
         script = mock_chdk.execute_script.call_args.args[0]
-        assert "set_sv96" not in script
-        assert str(iso_to_sv96(400)) not in script
+        assert "sv96_market_to_real" in script
+        assert f"set_sv96({iso_to_sv96(400)})" not in script
 
     def test_real_iso_is_gone(self):
         dev, _ = self._make_device()
