@@ -35,21 +35,25 @@ def iso_to_sv96(real_iso):
     shooting_set_sv96, and its counterpart get_sv96 reads
     shooting_get_sv96_real (core/shooting.c) — both in real units.
 
-    Market ISO — the number in the camera's own ISO menu — is a
-    different quantity, and passing one here gives a wrong exposure
-    rather than an error. CHDK keeps the two apart deliberately: it
-    stores them in separate properties (PROPCASE_SV for real,
-    PROPCASE_SV_MARKET for market) and exposes iso_market_to_real,
-    iso_real_to_market, sv96_market_to_real and sv96_real_to_market to
-    move between them. The offset is per-camera — core/shooting.c
+    This is arithmetic, not a market-to-real conversion. Feed it a
+    market ISO — the number in the camera's own ISO menu — and you get
+    the sv96 for that number; the mistake is then treating that result
+    as a real sv96, which is what set_sv96 takes.
+
+    CHDK keeps the two quantities apart deliberately: it stores them in
+    separate properties (PROPCASE_SV for real, PROPCASE_SV_MARKET for
+    market) and exposes iso_market_to_real, iso_real_to_market,
+    sv96_market_to_real and sv96_real_to_market to move between them.
+    The offset is per-camera and is not one number: core/shooting.c
     defaults SV96_MARKET_OFFSET to 69 sv96 units under
     `#if !defined(SV96_MARKET_OFFSET)`, with the comment "Can be
-    overriden in platform_camera.h (see IXUS700 for example)". This
-    library does NOT convert between them: pass a real ISO, or convert
-    on the camera with CHDK's own functions before calling. That is what
-    ChdkDevice.shoot does — it takes the menu number and hands it to
-    set_iso_mode, letting the camera's own iso_table resolve it, and so
-    it does not call this function at all.
+    overriden in platform_camera.h (see IXUS700 for example)" — and the
+    IXUS700 platform does override it, to 20.
+
+    So this library does not convert between them. Before handing this
+    result to set_sv96, a market number needs the camera's own
+    market-to-real step. ChdkDevice.shoot does that on the camera and
+    therefore does not call this function at all; see its docstring.
 
     Read from the CHDK sources named above. Not measured on a camera.
 

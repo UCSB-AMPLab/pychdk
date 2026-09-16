@@ -888,6 +888,9 @@ class TestShootTakesTheMenuIsoAndNothingItCannotDo:
         dev, mock_chdk = self._make_device()
         dev.shoot(market_iso=400)
         script = mock_chdk.execute_script.call_args.args[0]
+        # Both halves are needed. Without the first this passes when the
+        # ISO is not set at all, which is the other way to get it wrong.
+        assert "set_sv96(" in script
         assert "set_iso_mode" not in script
 
     def test_the_menu_number_is_not_sent_as_real_sensitivity(self):

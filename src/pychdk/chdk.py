@@ -383,14 +383,16 @@ class ChdkPTP:
         remote capture is not initialized NOW, and there are at least
         two ways to arrive there that this status does not separate:
         init_usb_capture never ran, or it ran and the capture was
-        cancelled afterwards. CHDK cancels on its own download timeout
-        — the set_remotecap_timeout documentation says "following a
-        timeout, RemoteCaptureIsReady and RemoteCaptureGetData will
-        behave as if remote capture were not initialized"
-        (modules/luascript.c) — and also when a transfer errors, both
-        by way of remotecap_reset clearing the capture target
-        (core/remotecap.c). So read this as "not initialized", not as
-        "never initialized".
+        cancelled afterwards. CHDK clears the capture target after its
+        own download timeout — the set_remotecap_timeout documentation
+        says "following a timeout, RemoteCaptureIsReady and
+        RemoteCaptureGetData will behave as if remote capture were not
+        initialized" (modules/luascript.c) — and after certain
+        chunk-selection errors, both by way of remotecap_reset
+        (core/remotecap.c). A host-side transfer failure on its own
+        does not establish that the reset happened: the PTP handler
+        does not check what send_data returned (core/ptp.c). So read
+        this as "not initialized", not as "never initialized".
 
         Returns:
             Tuple of (is_ready, status). status is REMOTE_CAP_NOTSET

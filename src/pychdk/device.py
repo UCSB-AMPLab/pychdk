@@ -302,9 +302,10 @@ class ChdkDevice:
                 conversion, whose source comment reads "equivalent to
                 (short)(log2(iso/3.125)*96+0.5) [APEX equation]";
                 sv96_market_to_real subtracts SV96_MARKET_OFFSET, which
-                is per-camera and overridable in platform_camera.h; and
-                set_sv96 takes the real value. Nothing is converted
-                here, and the offset never touches this library.
+                is per-camera and overridable in platform_camera.h
+                (69 by default, 20 on the IXUS700); and set_sv96 takes
+                the real value. Nothing is converted here, and the
+                offset never touches this library.
 
                 Two things make this the right call rather than
                 set_iso_mode, which also takes a menu number:
@@ -318,14 +319,20 @@ class ChdkDevice:
                 card with CHDK's ISO override enabled, set_iso_mode
                 would be silently overridden and the caller's ISO lost.
 
-                Second, exactness. set_iso_mode snaps to the nearest
-                entry in the camera's iso_table; this path applies the
-                value asked for.
+                Second, the table. set_iso_mode selects the nearest
+                entry in the camera's iso_table; this path requests the
+                converted sv96 as an override without that lookup.
+                Whether the sensor then delivers that exposure is not
+                something the source can establish, and nobody has
+                measured it.
 
                 Passing a menu number straight to set_sv96 as though it
                 were already real — which this argument used to do —
-                makes the camera about 0.7 of a stop more sensitive
-                than asked, silently.
+                requested an override SV96_MARKET_OFFSET units above
+                the corrected request: 69 of the 96 units that make a
+                stop, on a camera using CHDK's default. The offset is
+                per-camera (the IXUS700 platform sets 20), so the size
+                of the old error varies by body.
             dng: Request DNG. Not implemented on either path: streaming
                 refuses it, and the card path ignores it.
             stream: If True, use remote capture (direct USB transfer).
@@ -465,9 +472,9 @@ class ChdkDevice:
                         "The capture script ended and remote capture is "
                         "not initialized: either init_usb_capture never "
                         "ran, or it ran and the capture was cancelled "
-                        "afterwards — CHDK cancels on its own download "
-                        "timeout and on a transfer error, and reports "
-                        "both the same way as never having initialized"
+                        "afterwards — CHDK clears the capture target "
+                        "after its own download timeout, and reports "
+                        "that the same way as never having initialized"
                     )
                 if time.monotonic() >= init_deadline:
                     raise RuntimeError(

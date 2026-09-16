@@ -52,10 +52,11 @@ See "The ISO argument" below.
   `is_record, is_video, mode` — where `is_record` is `!mode_play` and so is
   *true* in record mode (`luaCB_get_mode`, `modules/luascript.c`). Since
   `execute_lua_wait` returns only the first RET value, the library was reading
-  `is_record` and negating it. The inversion survived three releases with no
-  visible symptom precisely because the loop fell through and returned on
-  failure; it now raises, and the comment names the language and all three
-  return values.
+  `is_record` and negating it. An exhausted confirmation loop returned
+  without raising, so a caller could not distinguish an unconfirmed switch
+  from a confirmed one — which is as much as the code establishes about why
+  this went unnoticed for three releases. It now raises, and the comment names
+  the language and all three return values.
 - **`get_frames` requested no pixel data.** It called `get_display_data()`
   with the default `flags=0`. CHDK's `live_view_get_data` adds each data block
   only if the matching `LV_TFR_*` bit was requested (`core/live_view.c`), so a
@@ -103,8 +104,10 @@ back to the camera's *own configured* ISO override only when none was set
 (`photo_param_put_off.sv96`, `:558`); `set_iso_mode` does not. So on a card
 with CHDK's ISO override enabled, `set_iso_mode` would have been silently
 beaten and the operator's ISO lost. The chain above keeps script priority
-*and* converts honestly. It is also exact, where `set_iso_mode` snaps to the
-nearest ladder entry.
+*and* converts honestly, and it requests the converted value as an override
+rather than selecting the nearest entry in the camera's ISO table. What the
+sensor then delivers is not something the source can establish, and nobody
+has measured it on one of these bodies.
 
 The shutter path was checked for the same disease and does not have it: `tv96`
 is a single real quantity with no market variant, and `set_tv96_direct`
@@ -191,11 +194,34 @@ applies the value as given rather than snapping it (`core/shooting.c`).
 
 ## Tests
 
-`.venv/bin/python -m pytest tests/ -q` — 205 passed before, 225 after. New
+`.venv/bin/python -m pytest tests/ -q` — 205 passed before, **229** after. New
 coverage: the `switch_mode` polarity (written from CHDK's sources so that it
 fails under either inversion, not from what the implementation expects), the
 raise on an unconfirmed switch, the live-view transfer flags, the removed
-`shoot` keywords, and six cases around the flasher's confirmation prompt.
+`shoot` keywords, and eight cases around the flasher's confirmation prompt.
+
+## Releasing this
+
+The order matters, and one step is a trap:
+
+1. **Merge this branch.**
+2. **Tag `v0.1.3` on the merged tree — not on the `chore(release): 0.1.3`
+   commit.** That commit bumps the version while `shoot()` still took
+   `real_iso`, a signature Captua does not call. Tagging it would publish a
+   release that raises `TypeError` on the only consumer. Tag the final tree.
+3. **Bump the backend's pin in all three places together**: `requirements.txt`,
+   `pixi.toml`, and `pixi.lock` (the git ref appears once per platform plus once
+   in the package stanza, where the `version:` field also has to move). A
+   requirements-only bump leaves the Pixi environment on 0.1.2, which is the
+   environment the appliance actually runs.
+4. Only then release the backend.
+
+`pychdk`'s own dependencies are unchanged between 0.1.2 and 0.1.3 — `pyusb>=1.2.0`,
+`pytest>=7.0` for dev, `requires-python >=3.11` — so the lock edit is a ref and
+version substitution, not a re-resolution.
+
+Bumping before the tag exists breaks installation; changing only some pins leaves
+the installed environment inconsistent with the declared one.
 
 ## A note on how this release was reviewed
 
@@ -207,3 +233,16 @@ the inverted polarity. That is the same failure mode this release exists to
 correct, reproduced inside the correction. The tests were green throughout.
 Prose has no tests; the only check on it is someone reading it against the
 source, twice.
+
+A further review then read the whole thing from a fresh context, with none of
+the earlier framing, and found eleven more. Two were sentences describing an
+implementation this release had already replaced — the ISO argument was
+rewritten three times, and two docstrings were still describing the second
+version. Others turned source agreement into claims about achieved exposure,
+stated a per-camera offset as though it were universal (the IXUS700 platform
+sets 20, not 69), and repeated an "alpha-level" description of the A2500 that
+CHDK's own `camera_list.csv` does not support. One test asserted that the ISO
+was not set the wrong way without asserting that it was set at all.
+
+The reviewer with no shared context found more than the one that had been
+following along. That is worth remembering the next time a review looks clean.
