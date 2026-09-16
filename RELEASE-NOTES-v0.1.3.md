@@ -77,8 +77,10 @@ related to real sensitivity by a per-camera offset (`SV96_MARKET_OFFSET`,
 defaulting to 69 sv96 units and overridable per platform, `core/shooting.c`).
 `shooting_sv96_market_to_real` subtracts that offset, so real sensitivity sits
 *below* the menu number: sending the menu number as though it were real made
-the camera about 0.7 of a stop **more** sensitive than the operator asked for
-(69 of the 96 sv96 units that make a stop), silently.
+the old code **request** an override about 0.72 of a stop above the corrected
+request — 69 of the 96 sv96 units that make a stop, on a platform using CHDK's
+default offset — silently. What the sensor then did with that request is not
+something the source establishes, and nobody has measured it.
 
 The first draft of this release renamed the argument to `real_iso` and left
 the conversion alone, on the grounds that the code had never treated the value
@@ -139,7 +141,10 @@ applies the value as given rather than snapping it (`core/shooting.c`).
   reports it identically — "following a timeout, RemoteCaptureIsReady and
   RemoteCaptureGetData will behave as if remote capture were not initialized"
   (`set_remotecap_timeout`, `modules/luascript.c`; the mechanism is
-  `remotecap_reset` in `core/remotecap.c`, also reached on a transfer error).
+  `remotecap_reset` in `core/remotecap.c`, also reached on certain
+  chunk-selection errors; a host-side transfer failure alone does not establish
+  that the reset happened, since the PTP handler does not check what
+  `send_data` returned).
   The docstring and the matching `RuntimeError` in `device.py` now say what
   the status establishes: remote capture is not initialised *now*, for at
   least two reasons it cannot distinguish.

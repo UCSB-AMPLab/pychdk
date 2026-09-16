@@ -898,8 +898,9 @@ class TestShootTakesTheMenuIsoAndNothingItCannotDo:
 
         This is the fault the argument used to have: the menu number was
         run through iso_to_sv96 and handed straight to set_sv96, which
-        takes real sensitivity — about 0.7 of a stop more sensitive than
-        asked, silently. The conversion has to be in the script.
+        takes real sensitivity, so the override requested sat about 0.72 of
+        a stop above the corrected one on a platform using the default
+        69-unit offset. The conversion has to be in the script.
         """
         dev, mock_chdk = self._make_device()
         dev.shoot(market_iso=400)
