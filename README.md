@@ -51,8 +51,23 @@ print(result)  # 4
 # Switch to record mode and capture
 cam.switch_mode("record")
 data = cam.shoot(stream=True)  # JPEG bytes via remote capture
+dng = cam.shoot(stream=True, dng=True)  # DNG bytes
+both = cam.shoot(stream=True, dng=True, jpeg=True)  # one exposure
+both.dng, both.jpeg  # DNG and the camera's JPEG
 cam.close()
 ```
+
+### DNG capture
+
+`shoot(stream=True, dng=True)` asks CHDK for the DNG header and the raw data (`init_usb_capture(6)`), fetches each as the camera offers it, and returns a complete DNG file as bytes. Adding `jpeg=True` asks for the JPEG too (`init_usb_capture(7)`) and returns a `DngCapture` with `.dng` and `.jpeg`, both from the same exposure and the same script.
+
+The camera does not send a thumbnail, and sends the raw data with every pair of bytes swapped. `pychdk.assemble_dng(header, raw)` builds the file: it reads the thumbnail and raw strip offsets and sizes from the header, swaps the byte pairs, makes the 8-bit RGB thumbnail the header describes by sampling the raw data (black and white levels, as-shot white balance, a display gamma), and writes header, thumbnail and raw data end to end. It raises `DngError`, a `ValueError`, when the header is not a TIFF it can read, when the raw data's length differs from what the header declares, or when the header's offsets do not lay the three out end to end. It is pure Python with no I/O; for an A2500 frame it takes a few hundredths of a second on a desktop Mac.
+
+What was measured, on one Canon PowerShot A2500 running CHDK 1.5.1, one capture each with formats 6 and 7: the header (1,344 bytes) is ready about 1.8 s after the script starts; the raw data (24,724,224 bytes, 4704x3504 at 12 bits) is ready right after it and arrives in one chunk, fetched in 0.84 s; with format 7 the ready mask then reads 0 while the script is still running, and the JPEG is ready at about 4.0 s and arrives in several chunks with seeks. The mask showed one format at a time. A file built from those parts — header, 36,864 thumbnail bytes, then the raw data with its byte pairs swapped — opened and rendered correctly in macOS. A file written by `assemble_dng` itself has not yet been opened in a viewer.
+
+`shoot(stream=True, dng=True, jpeg=True)` itself was then run once on each of two A2500s (4.2 s and 4.1 s per capture); both files opened in macOS.
+
+Not yet verified: repeated captures, any other camera or CHDK build (including the 1.6.1 build `tools/flash_chdk.py` installs), and viewers other than macOS. The byte-pair swap is applied unconditionally and has been established on the A2500 only.
 
 ### Multi-camera capture
 
@@ -85,6 +100,7 @@ pyusb / libusb    — raw USB access
 | `usb_transport.py` | USB device discovery, interface claiming, bulk I/O |
 | `ptp.py` | PTP container packing/unpacking, session lifecycle, transactions |
 | `chdk.py` | CHDK commands — script execution, message queue, file transfer, remote capture |
+| `dng.py` | DNG assembly from the remote capture header and raw data; standard library only |
 | `device.py` | `ChdkDevice` class and `list_devices()` discovery |
 | `multicam.py` | `MultiCam` class for concurrent operations across cameras |
 | `util.py` | APEX96 conversions (`shutter_to_tv96`, `iso_to_sv96`, `aperture_to_av96`) and camera path helpers |
@@ -142,6 +158,7 @@ src/pychdk/
   ptp.py               # PTP protocol containers and sessions
   chdk.py              # CHDK extension protocol
   device.py            # high-level ChdkDevice API
+  dng.py               # DNG assembly from remote capture parts
   multicam.py          # multi-camera coordination
   util.py              # exposure conversions, path helpers
 tests/
@@ -149,6 +166,8 @@ tests/
   test_ptp.py
   test_chdk.py
   test_device.py
+  test_dng.py
+  data/                # a DNG header from an A2500, for test_dng.py
   test_multicam.py
   test_util.py
 examples/
@@ -160,7 +179,7 @@ tools/
 
 ## Known limitations
 
-- **Remote capture on A2500 is unverified**: `tools/flash_chdk.py` installs CHDK 1.6.1 r6315 for A2500 firmware 1.00A, and this library's streaming remote capture has never been run against that camera. Earlier versions of this file called the port "alpha-level"; that is not supported by the build we install — `camera_list.csv` in release-1_6 carries a `BETA_STATUS` column, 34 of its 397 entries are marked `ALPHA` or `BETA`, and the A2500's entry (`a2500,100a,,,`) is not one of them. The same sentence reported a `0x2002` failure on this camera; we have no record of observing it, so treat that as a possibility to test rather than a known behaviour. What the code does establish is that if streaming does fail, the library does not fall back — the exception reaches the caller and nothing else is attempted. Nor does the exception tell you what state the camera is in: the failure can come from the script submission, before `init_usb_capture` has run at all, or from a capture that initialized and was then cancelled. So whether USB remote capture is still enabled afterwards, and whether an ordinary `shoot()` would recover the picture, are both unestablished. Recovery is an open question for the bench, not a documented workaround.
+- **Remote capture on A2500 is verified only in part**: one A2500 running CHDK 1.5.1 delivered the DNG header, raw data and JPEG of one exposure with `init_usb_capture(7)`, and the header and raw data with `init_usb_capture(6)`, one capture each (see "DNG capture" above). Streamed JPEG has run further: two A2500s under CHDK 1.5.1 took 1,200 pairs, 2,400 captures, in one session on 12 November 2026, and every file was a whole JPEG. That is not the build `tools/flash_chdk.py` installs — CHDK 1.6.1 r6315 for A2500 firmware 1.00A — and streaming has not been run against that build. Earlier versions of this file called the port "alpha-level"; that is not supported by the build we install — `camera_list.csv` in release-1_6 carries a `BETA_STATUS` column, 34 of its 397 entries are marked `ALPHA` or `BETA`, and the A2500's entry (`a2500,100a,,,`) is not one of them. The same sentence reported a `0x2002` failure on this camera; we have no record of observing it, so treat that as a possibility to test rather than a known behaviour. What the code does establish is that if streaming does fail, the library does not fall back — the exception reaches the caller and nothing else is attempted. Nor does the exception tell you what state the camera is in: the failure can come from the script submission, before `init_usb_capture` has run at all, or from a capture that initialized and was then cancelled. So whether USB remote capture is still enabled afterwards, and whether an ordinary `shoot()` would recover the picture, are both unestablished. Recovery is an open question for the bench, not a documented workaround.
 - **macOS only** for `tools/flash_chdk.py`. The library itself works on macOS and Linux.
 - **Canon cameras only** — CHDK is Canon-specific. Device discovery defaults to Canon's USB vendor ID (`0x04A9`).
 

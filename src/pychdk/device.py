@@ -22,6 +22,7 @@ from pychdk.chdk import (
     REMOTE_CAP_RAW,
     REMOTE_CAP_DNG_HDR,
 )
+from pychdk.dng import assemble_dng
 from pychdk.util import shutter_to_tv96
 
 
@@ -35,6 +36,48 @@ CAPTURE_INIT_GRACE = 5.0
 DeviceInfo = namedtuple("DeviceInfo", [
     "vendor_id", "product_id", "bus_num", "device_num", "serial_num",
 ])
+
+DngCapture = namedtuple("DngCapture", ["dng", "jpeg"])
+DngCapture.__doc__ = """A DNG and the camera's JPEG from one exposure.
+
+Returned by shoot(stream=True, dng=True, jpeg=True). Both fields are
+bytes: dng is a complete file, jpeg is the JPEG exactly as the camera
+sent it.
+"""
+
+# The order the parts of a DNG capture are fetched in when the camera
+# offers more than one at once, and their names for messages. An A2500
+# offers them one at a time, in this order.
+_FETCH_ORDER = (REMOTE_CAP_DNG_HDR, REMOTE_CAP_RAW, REMOTE_CAP_JPEG)
+_PART_NAMES = {
+    REMOTE_CAP_DNG_HDR: "DNG header",
+    REMOTE_CAP_RAW: "raw data",
+    REMOTE_CAP_JPEG: "JPEG",
+}
+
+
+def _name_parts(mask):
+    names = [_PART_NAMES[flag] for flag in _FETCH_ORDER if mask & flag]
+    if len(names) <= 1:
+        return "".join(names)
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _arrived(received, remaining):
+    """Say which parts arrived and which did not, for an error message.
+
+    Empty when nothing arrived, so a capture that fails before its first
+    part reads exactly as it always has.
+    """
+    if not received:
+        return ""
+    got = 0
+    for flag in received:
+        got |= flag
+    return (
+        f"; received the {_name_parts(got)}, "
+        f"not the {_name_parts(remaining)}"
+    )
 
 
 def list_devices():
@@ -283,7 +326,7 @@ class ChdkDevice:
             return None
 
     def shoot(self, shutter_speed=None, market_iso=None, dng=False,
-              stream=False):
+              stream=False, jpeg=False):
         """Capture a photo.
 
         Args:
@@ -333,19 +376,37 @@ class ChdkDevice:
                 stop, on a camera using CHDK's default. The offset is
                 per-camera (the IXUS700 platform sets 20), so the size
                 of the old error varies by body.
-            dng: Request DNG. Not implemented on either path: streaming
-                refuses it, and the card path ignores it.
+            dng: With stream=True, return a DNG built from the
+                camera's DNG header and raw data instead of the JPEG.
+                The card path ignores it: it runs shoot() and takes
+                whatever the camera is set to produce.
             stream: If True, use remote capture (direct USB transfer).
+            jpeg: With stream=True and dng=True, also return the
+                camera's JPEG of the same exposure, from the same
+                script. With stream=True alone it changes nothing: the
+                JPEG is what streaming returns anyway. It needs
+                stream=True.
 
         Returns:
-            The JPEG as bytes when stream=True. Otherwise None: the
-            camera shoots to its own SD card and nothing is fetched
-            back: shoot() does not discover or return the saved
-            filename. download_file fetches a card file by path, and
-            CHDK's own Lua (get_image_dir, the exposure counter, a
-            directory listing) can be used to find one — none of that
-            happens here.
+            When stream=True: the JPEG as bytes; with dng=True, the DNG
+            as bytes; with dng=True and jpeg=True, a DngCapture holding
+            both. Otherwise None: the camera shoots to its own SD card
+            and nothing is fetched back: shoot() does not discover or
+            return the saved filename. download_file fetches a card
+            file by path, and CHDK's own Lua (get_image_dir, the
+            exposure counter, a directory listing) can be used to find
+            one — none of that happens here.
+
+        Raises:
+            ValueError: If jpeg=True without stream=True. A DngError,
+                which is a ValueError, if the DNG parts cannot be
+                assembled.
         """
+        if jpeg and not stream:
+            raise ValueError(
+                "jpeg=True applies to streamed capture only; pass "
+                "stream=True and dng=True"
+            )
         parts = []
         if shutter_speed is not None:
             tv96 = shutter_to_tv96(shutter_speed)
@@ -359,12 +420,25 @@ class ChdkDevice:
             )
 
         if stream:
-            return self._shoot_streaming(parts, dng)
+            return self._shoot_streaming(parts, dng, jpeg)
         else:
             return self._shoot_standard(parts)
 
-    def _shoot_streaming(self, setup_parts, dng):
+    def _shoot_streaming(self, setup_parts, dng, jpeg=False):
         """Capture using remote capture (PTP commands 13/14).
+
+        Asks for the JPEG alone (init_usb_capture(1)), or with dng for
+        the DNG header and raw data (6), or with jpeg as well for all
+        three (7), and fetches each part as the camera offers it.
+
+        Measured on one Canon PowerShot A2500 with CHDK 1.5.1, one
+        capture each with 6 and 7: the header (0x04, 1,344 bytes) is
+        ready about 1.8 s after the script starts and the raw data
+        (0x02, 24,724,224 bytes, one chunk) right after it; with 7 the
+        ready mask then reads 0 while the script is still running, and
+        the JPEG (0x01, several chunks with seeks) is ready at about
+        4.0 s. The mask showed one format at a time. The camera sends
+        no thumbnail; assemble_dng makes one.
 
         The chunk count is zeroed here, at the attempt, rather than
         where the download begins: a capture refused, or one that never
@@ -389,28 +463,43 @@ class ChdkDevice:
         capture does not read a stale message: it is a bounded sweep of
         what is already waiting, not a wait for a result still to come.
 
+        Every part is fetched once. Nothing is retried: a part that
+        never arrives ends the capture with an error naming the parts
+        that did.
+
         Raises:
             RuntimeError: If the camera refuses to initialize remote
-                capture.
-            NotImplementedError: If dng is True. CHDK's DNG_HDR flag
-                sends the DNG header only; the raw data is a separate
-                transfer, and the client has to splice the two into a
-                file. This method downloads one format, so it cannot,
-                and _shoot_standard does not request a DNG either.
+                capture, the script fails, the camera offers a part
+                that was not asked for or was already taken, or the
+                script ends before every part has arrived.
+            TimeoutError: If the parts have not all arrived by the
+                deadline.
+            DngError: If the header and raw data cannot be assembled.
         """
         self._chdk.reset_capture_chunks()
 
         if dng:
-            raise NotImplementedError(
-                "DNG capture is not implemented. Streaming would need the "
-                "DNG header and the raw data fetched as two separate "
-                "transfers and assembled into a file on this side, which "
-                "this library does not do; capturing to the card does not "
-                "request a DNG either, it runs shoot() and takes whatever "
-                "the camera is set to produce. Streamed JPEG works."
-            )
+            fmt = REMOTE_CAP_DNG_HDR | REMOTE_CAP_RAW
+            if jpeg:
+                fmt |= REMOTE_CAP_JPEG
+        else:
+            fmt = REMOTE_CAP_JPEG
+        received = self._capture_parts(setup_parts, fmt)
+        if not dng:
+            return received[REMOTE_CAP_JPEG]
+        image = assemble_dng(
+            received[REMOTE_CAP_DNG_HDR], received[REMOTE_CAP_RAW],
+        )
+        if jpeg:
+            return DngCapture(dng=image, jpeg=received[REMOTE_CAP_JPEG])
+        return image
 
-        fmt = REMOTE_CAP_JPEG
+    def _capture_parts(self, setup_parts, fmt):
+        """Run one capture script and fetch every format in fmt.
+
+        Returns:
+            {format flag: bytes} for every bit in fmt.
+        """
         setup = "".join(part + "; " for part in setup_parts)
         script = (
             f"{setup}local ok = init_usb_capture({fmt}); "
@@ -420,7 +509,8 @@ class ChdkDevice:
         )
         script_id = self._chdk.execute_script(script)
 
-        image = None
+        received = {}
+        remaining = fmt
         deadline = time.monotonic() + 30
         grace = CAPTURE_INIT_GRACE
         init_deadline = time.monotonic() + grace
@@ -428,16 +518,28 @@ class ChdkDevice:
             ready, status = self._chdk.remote_capture_is_ready()
             formats = status
             if ready:
-                # A mask without the format we asked for is a fault, not
-                # a menu: the other bits are a different picture.
-                if not formats & fmt:
+                # A mask without a format still to come is a fault, not
+                # a menu: the other bits are a different picture, or a
+                # part already taken.
+                wanted = formats & remaining
+                if not wanted:
                     raise RuntimeError(
-                        f"The camera has no 0x{fmt:02x} data ready; "
+                        f"The camera has no 0x{remaining:02x} data ready; "
                         f"it offers 0x{formats:02x}"
+                        + _arrived(received, remaining)
                     )
                 # The request parameter is one bit, not the whole mask.
-                image = self._chdk.remote_capture_get_data(fmt)
-                break
+                flag = next(f for f in _FETCH_ORDER if wanted & f)
+                if fmt == REMOTE_CAP_JPEG:
+                    received[flag] = self._chdk.remote_capture_get_data(flag)
+                else:
+                    received[flag] = self._chdk.remote_capture_get_data(
+                        flag, accumulate=True,
+                    )
+                remaining &= ~flag
+                if not remaining:
+                    break
+                continue
 
             running, has_msgs = self._chdk.get_script_status()
             if has_msgs:
@@ -475,20 +577,29 @@ class ChdkDevice:
                         "afterwards — CHDK clears the capture target "
                         "after its own download timeout, and reports "
                         "that the same way as never having initialized"
+                        + _arrived(received, remaining)
                     )
-                if time.monotonic() >= init_deadline:
+                if time.monotonic() >= init_deadline and not received:
                     raise RuntimeError(
                         "The capture script did not initialize remote "
                         f"capture within {grace}s and is still running"
                     )
             if not running:
+                if received:
+                    raise RuntimeError(
+                        "The capture script finished before every part "
+                        "arrived" + _arrived(received, remaining)
+                    )
                 raise RuntimeError(
                     "The capture script finished without producing a capture"
                 )
             time.sleep(0.1)
 
-        if image is None:
-            raise TimeoutError("Remote capture did not complete")
+        if remaining:
+            raise TimeoutError(
+                "Remote capture did not complete"
+                + _arrived(received, remaining)
+            )
 
         # Clear what the script left behind so the next capture does not
         # read a stale message — but never at the cost of this picture.
@@ -496,7 +607,7 @@ class ChdkDevice:
             self._chdk.drain_messages()
         except Exception:
             pass
-        return image
+        return received
 
     def _shoot_standard(self, setup_parts):
         """Capture to the camera's SD card and leave it there.

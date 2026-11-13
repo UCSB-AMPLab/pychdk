@@ -44,7 +44,9 @@ class MultiCam:
         Returns:
             One entry per camera, in the same order as self.cameras.
             What the entries are depends on the path taken. With
-            stream=True each is the JPEG bytes that camera sent back.
+            stream=True each is what ChdkDevice.shoot returned for that
+            camera: the JPEG bytes, the DNG bytes with dng=True, or a
+            DngCapture with dng=True and jpeg=True.
             Otherwise each camera shoots to its own SD card and every
             entry is None — shoot() does not discover or return the saved
             filenames. ChdkDevice.download_file fetches a card file by
