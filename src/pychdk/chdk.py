@@ -450,7 +450,7 @@ class ChdkPTP:
             data = data[:size]
         return data, more, position
 
-    def remote_capture_get_data(self, format_flag):
+    def remote_capture_get_data(self, format_flag, accumulate=False):
         """Download remote capture image data.
 
         Loops over remote_capture_get_chunk until the camera clears its
@@ -463,6 +463,11 @@ class ChdkPTP:
 
         Args:
             format_flag: Which format to download (JPEG=1, RAW=2, DNG_HDR=4).
+            accumulate: If True, add this download's chunks to
+                last_capture_chunks instead of starting the count
+                again. A capture that fetches several formats passes
+                it, having zeroed the count with reset_capture_chunks,
+                so the count covers the whole capture.
 
         The chunk count is left in last_capture_chunks rather than
         returned, so the signature callers depend on is unchanged.
@@ -475,7 +480,8 @@ class ChdkPTP:
         """
         image = bytearray()
         cursor = 0
-        self._last_capture_chunks = 0
+        if not accumulate:
+            self._last_capture_chunks = 0
         for _ in range(MAX_CAPTURE_CHUNKS):
             chunk, more, position = self.remote_capture_get_chunk(format_flag)
             self._last_capture_chunks += 1

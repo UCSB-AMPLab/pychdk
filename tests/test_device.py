@@ -4,6 +4,7 @@ import signal
 import struct
 import sys
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
 import pychdk
@@ -21,10 +22,12 @@ from pychdk.chdk import (
 )
 from pychdk.device import (
     ChdkDevice,
+    DngCapture,
     list_devices,
     DeviceInfo,
     _open_devices,
 )
+from pychdk.dng import DngError, assemble_dng
 from pychdk.ptp import PTPError
 from pychdk.util import iso_to_sv96
 
@@ -132,8 +135,15 @@ class TestCaptureChunkCountThroughShoot:
         assert dev.shoot(stream=True) == b"JPEG"
         assert dev.last_capture_chunks == 1
 
-        with pytest.raises(NotImplementedError):
-            dev.shoot(dng=True, stream=True)
+        session.transaction.side_effect = [
+            ([8, 0], b""),                  # script starts, id 8
+            ([0], b""),                     # nothing ready
+            ([0b11], b""),                  # running, message waiting
+            ([MessageType.RET, ScriptDataType.BOOLEAN, 8, 4],
+             struct.pack("<I", 0)),         # init_usb_capture said false
+        ]
+        with pytest.raises(RuntimeError, match="refused to initialize"):
+            dev.shoot(stream=True)
         assert dev.last_capture_chunks == 0
 
     def test_a_second_capture_that_ends_without_data_reports_nothing(
@@ -350,21 +360,6 @@ class TestChdkDevice:
              struct.pack("<I", 1)),  # is_record true: CHDK Lua for record
         ]
         dev.switch_mode("record")
-
-    def test_streamed_dng_is_refused(self):
-        dev, mock_chdk = self._make_device()
-        with pytest.raises(NotImplementedError, match="DNG"):
-            dev.shoot(dng=True, stream=True)
-
-    def test_the_dng_refusal_does_not_advise_the_card_path(self):
-        dev, mock_chdk = self._make_device()
-        with pytest.raises(NotImplementedError) as caught:
-            dev.shoot(dng=True, stream=True)
-        message = str(caught.value)
-        # _shoot_standard runs shoot() and never asks for a DNG, so
-        # sending the caller there would be advice that does nothing.
-        assert "stream=False" not in message
-        assert "card" in message.lower()
 
     def test_the_card_path_does_not_request_a_dng(self):
         dev, mock_chdk = self._make_device()
@@ -930,3 +925,297 @@ class TestShootTakesTheMenuIsoAndNothingItCannotDo:
             call.args[0] for call in mock_chdk.execute_script.call_args_list
         ]
         assert not any("os.listdir" in s for s in scripts)
+
+
+HEADER_PATH = Path(__file__).parent / "data" / "a2500_dng_header.bin"
+DNG_HDR, RAW, JPEG = 0x04, 0x02, 0x01
+
+# The JPEG script exactly as the library has always sent it.
+JPEG_SCRIPT = (
+    "local ok = init_usb_capture(1); "
+    "if ok == false then return false end; "
+    "shoot(); "
+    "return true"
+)
+
+
+@pytest.fixture(scope="module")
+def dng_parts():
+    """A real A2500 header and raw data of the length it declares.
+
+    The raw bytes are a repeated row rather than a picture: what is
+    under test here is the transfer, not the image.
+    """
+    header = HEADER_PATH.read_bytes()
+    row = bytes(range(256)) * 27 + bytes(144)       # 7,056 bytes
+    raw = row * 3504                                 # 24,724,224 bytes
+    return header, raw
+
+
+class _StreamingCamera:
+    """A camera that serves remote capture parts the way an A2500 does.
+
+    Measured on the bench with init_usb_capture(7): the DNG header is
+    ready first, the raw data right after it, and the JPEG some seconds
+    later; the ready mask shows one format at a time and reads 0 between
+    the raw data and the JPEG while the script is still running.
+
+    Each part is (flag, idle_polls, chunks): idle_polls is how many
+    ready polls answer 0 before the part is offered, and chunks is a
+    list of (data, position) with position -1 for no seek. The script
+    runs until every part has been taken, unless ends_after says it
+    stops once that many parts have gone.
+    """
+
+    def __init__(self, parts, ends_after=None, script_id=7):
+        self.parts = [list(p) for p in parts]
+        self.ends_after = ends_after
+        self.script_id = script_id
+        self.scripts = []
+        self.fetches = []
+        self.polls = []
+        self.taken = 0
+        self._chunk = 0
+
+    @property
+    def running(self):
+        if self.ends_after is not None and self.taken >= self.ends_after:
+            return False
+        return self.taken < len(self.parts)
+
+    def respond(self, operation, params=None, **kwargs):
+        command = params[0]
+        if command == ChdkCommand.EXECUTE_SCRIPT:
+            self.scripts.append(kwargs.get("send_data"))
+            return ([self.script_id, 0], b"")
+        if command == ChdkCommand.REMOTE_CAPTURE_IS_READY:
+            mask = 0
+            if self.running and self.taken < len(self.parts):
+                part = self.parts[self.taken]
+                if part[1] > 0:
+                    part[1] -= 1
+                else:
+                    mask = part[0]
+            self.polls.append(mask)
+            return ([mask], b"")
+        if command == ChdkCommand.REMOTE_CAPTURE_GET_DATA:
+            flag = params[1]
+            self.fetches.append(flag)
+            part = self.parts[self.taken]
+            assert flag == part[0], f"asked for {flag}, offering {part[0]}"
+            data, position = part[2][self._chunk]
+            self._chunk += 1
+            more = self._chunk < len(part[2])
+            if not more:
+                self.taken += 1
+                self._chunk = 0
+            return ([len(data), int(more), position & 0xFFFFFFFF], data)
+        if command == ChdkCommand.SCRIPT_STATUS:
+            return ([0b01 if self.running else 0], b"")
+        raise AssertionError(f"unexpected command {command}")
+
+
+def _a2500_parts(header, raw, jpeg=True):
+    parts = [
+        (DNG_HDR, 3, [(header, -1)]),
+        (RAW, 0, [(raw, -1)]),
+    ]
+    if jpeg:
+        # Three chunks, the last seeking back into the middle.
+        parts.append((JPEG, 4, [
+            (b"\xff\xd8AAAA", -1),
+            (b"CCCC\xff\xd9", 10),
+            (b"BBBB", 6),
+        ]))
+    return parts
+
+
+class TestStreamedDng:
+    """shoot(stream=True, dng=True), against the bench-measured order."""
+
+    def _device(self, camera, monkeypatch):
+        info = DeviceInfo(
+            vendor_id=0x04A9, product_id=0x1234,
+            bus_num=1, device_num=5, serial_num="ABC",
+        )
+        session = MagicMock()
+        with patch("pychdk.device.PTPDevice"), \
+             patch("pychdk.device.PTPSession", return_value=session):
+            dev = ChdkDevice(info, _usb_device=MagicMock())
+        session.transaction.side_effect = camera.respond
+        # The clock never moves, so only the camera ends the loop, and
+        # the 0.1 s sleeps between polls cost nothing.
+        monkeypatch.setattr("pychdk.device.time", _FakeClock([0.0]))
+        return dev
+
+    def _script(self, camera):
+        assert len(camera.scripts) == 1
+        return camera.scripts[0].rstrip(b"\x00").decode()
+
+    def test_dng_alone_returns_the_assembled_file(
+        self, dng_parts, monkeypatch,
+    ):
+        header, raw = dng_parts
+        camera = _StreamingCamera(_a2500_parts(header, raw, jpeg=False))
+        dev = self._device(camera, monkeypatch)
+        result = dev.shoot(stream=True, dng=True)
+        assert isinstance(result, bytes)
+        assert result == assemble_dng(header, raw)
+
+    def test_dng_alone_asks_for_header_and_raw_only(
+        self, dng_parts, monkeypatch,
+    ):
+        header, raw = dng_parts
+        camera = _StreamingCamera(_a2500_parts(header, raw, jpeg=False))
+        dev = self._device(camera, monkeypatch)
+        dev.shoot(stream=True, dng=True)
+        assert "init_usb_capture(6)" in self._script(camera)
+        assert camera.fetches == [DNG_HDR, RAW]
+
+    def test_dng_and_jpeg_come_from_one_script(
+        self, dng_parts, monkeypatch,
+    ):
+        header, raw = dng_parts
+        camera = _StreamingCamera(_a2500_parts(header, raw))
+        dev = self._device(camera, monkeypatch)
+        result = dev.shoot(stream=True, dng=True, jpeg=True)
+        assert isinstance(result, DngCapture)
+        assert result.dng == assemble_dng(header, raw)
+        assert result.jpeg == b"\xff\xd8AAAABBBBCCCC\xff\xd9"
+        script = self._script(camera)
+        assert script == JPEG_SCRIPT.replace("(1)", "(7)")
+
+    def test_each_part_is_fetched_once_as_it_becomes_ready(
+        self, dng_parts, monkeypatch,
+    ):
+        header, raw = dng_parts
+        camera = _StreamingCamera(_a2500_parts(header, raw))
+        dev = self._device(camera, monkeypatch)
+        dev.shoot(stream=True, dng=True, jpeg=True)
+        # Header and raw in that order, three JPEG chunks, nothing twice.
+        assert camera.fetches == [DNG_HDR, RAW, JPEG, JPEG, JPEG]
+        # The mask read 0 between the raw data and the JPEG.
+        assert camera.polls[camera.polls.index(RAW) + 1] == 0
+
+    def test_the_chunk_count_covers_every_part(
+        self, dng_parts, monkeypatch,
+    ):
+        header, raw = dng_parts
+        camera = _StreamingCamera(_a2500_parts(header, raw))
+        dev = self._device(camera, monkeypatch)
+        dev.shoot(stream=True, dng=True, jpeg=True)
+        assert dev.last_capture_chunks == 5
+
+    def test_a_script_that_ends_before_the_jpeg_says_what_arrived(
+        self, dng_parts, monkeypatch,
+    ):
+        header, raw = dng_parts
+        camera = _StreamingCamera(_a2500_parts(header, raw), ends_after=2)
+        dev = self._device(camera, monkeypatch)
+        with pytest.raises(RuntimeError) as caught:
+            dev.shoot(stream=True, dng=True, jpeg=True)
+        message = str(caught.value)
+        assert "DNG header" in message
+        assert "raw data" in message
+        assert "JPEG" in message
+        assert "finished" in message
+        assert camera.fetches == [DNG_HDR, RAW]
+
+    def test_a_raw_part_that_never_arrives_times_out_naming_the_header(
+        self, dng_parts, monkeypatch,
+    ):
+        header, raw = dng_parts
+        camera = _StreamingCamera(
+            [(DNG_HDR, 0, [(header, -1)]), (RAW, 10**9, [(raw, -1)])],
+        )
+        dev = self._device(camera, monkeypatch)
+        monkeypatch.setattr(
+            "pychdk.device.time", _FakeClock([0.0] * 8 + [999.0]),
+        )
+        with pytest.raises(TimeoutError) as caught:
+            dev.shoot(stream=True, dng=True)
+        message = str(caught.value)
+        assert "did not complete" in message
+        assert "received the DNG header" in message
+        assert "raw data" in message
+        assert camera.fetches == [DNG_HDR]
+
+    def test_a_mask_offering_a_part_already_taken_is_a_fault(
+        self, dng_parts, monkeypatch,
+    ):
+        header, raw = dng_parts
+        camera = _StreamingCamera([
+            (DNG_HDR, 0, [(header, -1)]),
+            (DNG_HDR, 0, [(header, -1)]),
+        ])
+        dev = self._device(camera, monkeypatch)
+        with pytest.raises(RuntimeError, match=r"0x02.*0x04"):
+            dev.shoot(stream=True, dng=True)
+        assert camera.fetches == [DNG_HDR]
+
+    def test_a_script_error_after_the_header_names_it(
+        self, dng_parts, monkeypatch,
+    ):
+        header, raw = dng_parts
+        camera = _StreamingCamera(
+            [(DNG_HDR, 0, [(header, -1)]), (RAW, 10**9, [(raw, -1)])],
+        )
+        dev = self._device(camera, monkeypatch)
+        base = camera.respond
+        state = {"sent": False}
+
+        def respond(operation, params=None, **kwargs):
+            command = params[0]
+            # Once the header is taken the script has an error to
+            # report, and has ended once it has been read.
+            if command == ChdkCommand.SCRIPT_STATUS and camera.taken:
+                return ([0 if state["sent"] else 0b11], b"")
+            if command == ChdkCommand.READ_SCRIPT_MSG:
+                state["sent"] = True
+                return ([MessageType.ERR, ScriptErrorType.RUN, 7, 9],
+                        b"raw failed\x00")
+            return base(operation, params, **kwargs)
+
+        dev._chdk._session.transaction.side_effect = respond
+        with pytest.raises(RuntimeError, match="raw failed"):
+            dev.shoot(stream=True, dng=True)
+
+    def test_no_capture_shutdown_is_sent(self, dng_parts, monkeypatch):
+        header, raw = dng_parts
+        camera = _StreamingCamera(_a2500_parts(header, raw))
+        dev = self._device(camera, monkeypatch)
+        dev.shoot(stream=True, dng=True, jpeg=True)
+        assert len(camera.scripts) == 1
+        assert b"init_usb_capture(0)" not in camera.scripts[0]
+
+    def test_a_header_that_cannot_be_read_is_refused(
+        self, dng_parts, monkeypatch,
+    ):
+        header, raw = dng_parts
+        camera = _StreamingCamera([
+            (DNG_HDR, 0, [(b"not a tiff", -1)]),
+            (RAW, 0, [(raw, -1)]),
+        ])
+        dev = self._device(camera, monkeypatch)
+        with pytest.raises(DngError, match="not a TIFF"):
+            dev.shoot(stream=True, dng=True)
+
+    def test_the_jpeg_script_is_unchanged(self, monkeypatch):
+        camera = _StreamingCamera([(JPEG, 0, [(b"jpeg", -1)])])
+        dev = self._device(camera, monkeypatch)
+        assert dev.shoot(stream=True) == b"jpeg"
+        assert self._script(camera) == JPEG_SCRIPT
+        assert camera.fetches == [JPEG]
+
+    def test_jpeg_without_dng_is_the_plain_jpeg_path(self, monkeypatch):
+        camera = _StreamingCamera([(JPEG, 0, [(b"jpeg", -1)])])
+        dev = self._device(camera, monkeypatch)
+        assert dev.shoot(stream=True, jpeg=True) == b"jpeg"
+        assert self._script(camera) == JPEG_SCRIPT
+
+    def test_jpeg_on_the_card_path_is_refused(self, monkeypatch):
+        camera = _StreamingCamera([])
+        dev = self._device(camera, monkeypatch)
+        with pytest.raises(ValueError, match="stream"):
+            dev.shoot(dng=True, jpeg=True)
+        assert camera.scripts == []

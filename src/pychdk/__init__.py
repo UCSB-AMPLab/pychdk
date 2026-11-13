@@ -7,6 +7,7 @@ __all__ = [
     "ChdkDevice", "list_devices", "DeviceInfo", "install_signal_handlers",
     "PTPError", "ChdkPTP", "MultiCam", "util",
     "parse_own_txt", "format_own_txt",
+    "DngCapture", "assemble_dng", "DngError",
 ]
 
 # Submodules reachable as attributes of the package.
@@ -23,6 +24,9 @@ _EXPORTS = {
     "MultiCam": "pychdk.multicam",
     "parse_own_txt": "pychdk.util",
     "format_own_txt": "pychdk.util",
+    "DngCapture": "pychdk.device",
+    "assemble_dng": "pychdk.dng",
+    "DngError": "pychdk.dng",
 }
 
 

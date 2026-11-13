@@ -43,3 +43,12 @@ class TestExports:
     def test_unknown_name_raises_attribute_error(self):
         with pytest.raises(AttributeError, match="has no attribute 'nope'"):
             pychdk.nope
+
+
+class TestDngAssemblyStaysStdlibOnly:
+    def test_importing_pychdk_dng_does_not_pull_in_pyusb(self):
+        result = _run_import(
+            "import pychdk.dng, sys; print('usb' in sys.modules)"
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "False"
